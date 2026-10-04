@@ -1,11 +1,12 @@
 [project]
 name = "marvin-integration-buttondown"
-version = "0.3.0"
+version = "0.4.0"
 description = "Buttondown integration for Marvin — newsletter signups become Buttondown subscribers, confirm/unsubscribe sync back, and published issues become Buttondown drafts (or sends)."
 readme = "README.md"
 requires-python = ">=3.11"
 # 0.4: providers contribute webhook signature schemes (the `buttondown` scheme).
-dependencies = ["marvin-integration-sdk>=0.4,<1"]
+# 0.5: IntegrationError and declared error policies (`error_policy`, Handle, Retry).
+dependencies = ["marvin-integration-sdk>=0.5,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11"]

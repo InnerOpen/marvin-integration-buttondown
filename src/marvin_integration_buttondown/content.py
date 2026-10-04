@@ -12,16 +12,18 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   webhook's UUID into the API id → the entry with that id is published. `subscriber.unsubscribed`
   archives it the same way. A reader with no signup entry here (subscribed elsewhere) is skipped.
   A signup Buttondown refuses (spam firewall, an earlier unsubscribe) or that fails otherwise goes to
-  Needs review instead of waiting in the inbox like a pending one: the subscribe workflow's on-failure
-  steps record `buttondown_subscribe_error` ({code, message, at}) and the reason on the entry.
+  Needs review instead of waiting in the inbox like a pending one. That is the provider's error policy
+  (see `ButtondownProvider.error_policy`), applied by Marvin, not workflow steps: Marvin records the
+  failure on the entry as `integration_error.buttondown` and the message as its review reason, and
+  retries a Buttondown outage or rate limit first.
   Publishing a `newsletter-issue` entry → `create_issue_email` (draft by default; see the connection's
   Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
   `buttondown_email_id`, so a republish never makes a second email.
 
 Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
 step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
-signup entry fails the step). The on-failure steps need the release after rc.192; an older Marvin
-ignores them (the run fails and the entry stays in the inbox, as before).
+signup entry fails the step). The error policy needs a Marvin that reads SDK 0.5 policies; an older
+one ignores it (the run fails and the entry stays in the inbox, as before).
 
 The collections need no workflow: a signup's status already says where it stands (published =
 confirmed, archived = unsubscribed), so each is a smart collection over the signup type and one
@@ -64,7 +66,6 @@ ISSUE_TYPE_PARAM = {
 
 
 SUBSCRIBER_ID_KEY = "buttondown_subscriber_id"
-SUBSCRIBE_ERROR_KEY = "buttondown_subscribe_error"
 EMAIL_ID_KEY = "buttondown_email_id"
 DELIVERY_KEY = "buttondown_issue_delivery"
 
@@ -119,17 +120,9 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
                 },
                 {"kind": "entry", "op": "set_metadata", "metadata": {SUBSCRIBER_ID_KEY: "${steps.subscribe.output.subscriber_id}"}},
             ],
-            # Buttondown refused the address (or the call failed): say so on the entry and send it to Needs
-            # review, so it doesn't wait in the inbox looking pending. `code` is blocked / spammy /
-            # suppressed / unknown; the message says what to do (a suppressed reader is re-added in Buttondown).
-            "on_failure": [
-                {
-                    "kind": "entry",
-                    "op": "set_metadata",
-                    "metadata": {SUBSCRIBE_ERROR_KEY: {"code": "${error.code}", "message": "${error.message}", "at": "${error.at}"}},
-                },
-                {"kind": "entry", "op": "request_review", "reason": "${error.message}"},
-            ],
+            # No on_failure: a refused or failed subscribe is handled by the provider's error policy (review,
+            # after retries for an outage or rate limit). A copy applied before 0.4.0 keeps its on_failure
+            # steps, which Marvin runs instead of the policy — an override, still correct.
         }
     },
 )

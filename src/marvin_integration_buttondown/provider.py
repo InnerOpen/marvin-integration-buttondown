@@ -14,7 +14,7 @@ Buttondown quirks this hides:
   Every create here names its status explicitly.
 - Signups can be refused by Buttondown's spam firewall (``400 subscriber_blocked``) or because the
   address unsubscribed before (``subscriber_suppressed``); both come back as readable errors with a
-  stable ``code`` (see :class:`ButtondownError`) that the signup workflow's on-failure steps record.
+  stable ``code`` (see :class:`ButtondownError`), and ``error_policy`` tells Marvin what to do about each.
 - Re-subscribing an address that never confirmed (``unactivated``) is refused as "already exists" and
   sends nothing, so ``subscribe`` asks for a confirmation reminder (``POST /subscribers/{id}/send-reminder``).
 - Webhooks are account-wide, and several Marvin workspaces can share one Buttondown account. Each
@@ -23,16 +23,22 @@ Buttondown quirks this hides:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import ClassVar
 from urllib.parse import quote
 
 from marvin_integration_sdk import (
     CATEGORY_DESTINATION,
     CredentialField,
+    ErrorPolicy,
+    Handle,
     IntegrationContext,
+    IntegrationError,
     IntegrationProvider,
     ProviderAction,
     Response,
+    Retry,
     register_provider,
 )
 
@@ -53,13 +59,45 @@ ENTRY_METADATA_KEY = "marvin_entry_id"
 
 ALREADY_SUBSCRIBED = {"email_already_exists", "subscriber_already_exists"}
 UNACTIVATED = "unactivated"
-# The stable codes a failure carries (ButtondownError.code), for a workflow's on-failure steps to record
-# or branch on — Buttondown's own codes, folded to what a person does about them.
+# The stable codes a failure carries (ButtondownError.code) — Buttondown's own codes and HTTP statuses,
+# folded to what a person (or Marvin's retry) does about them. `error_policy` below handles each; a
+# workflow's own on-failure steps can still read it as `${error.code}`.
 CODE_BLOCKED = "blocked"  # the spam firewall refused the address (subscriber_blocked / email_blocked)
 CODE_SPAMMY = "spammy"  # …or the visitor's IP (ip_address_spammy)
 CODE_SUPPRESSED = "suppressed"  # the address unsubscribed before; only Buttondown can re-add it
-CODE_UNKNOWN = "unknown"  # anything else: an HTTP error, the network, a bad argument
+CODE_AUTH = "auth"  # no API key, or Buttondown rejected it (401/403): fix the connection
+CODE_RATE_LIMITED = "rate_limited"  # 429: Buttondown asked us to slow down (its Retry-After becomes retry_after)
+CODE_UNAVAILABLE = "unavailable"  # Buttondown couldn't be reached, timed out or failed on its side (5xx)
+CODE_UNKNOWN = "unknown"  # anything else: another HTTP error, a bad argument or config
 REFUSAL_CODES = {"subscriber_blocked": CODE_BLOCKED, "email_blocked": CODE_BLOCKED, "ip_address_spammy": CODE_SPAMMY}
+
+# How Marvin handles each code (it applies these; the provider never retries or alerts by itself).
+RETRY_UNAVAILABLE = Retry(backoff=(120, 600, 3600))  # 2m, 10m, 1h
+RETRY_RATE_LIMITED = Retry(backoff=(60, 300, 900))  # 1m, 5m, 15m — a Retry-After from Buttondown wins
+RETRY_ON_RECOVERY = Retry(backoff=(), on_recovery=True)  # once, as soon as the connection is healthy again
+REVIEW = Handle(review=True)
+FAIL = Handle()  # let the step fail as usual
+ERROR_POLICY: ErrorPolicy = {
+    CODE_BLOCKED: REVIEW,
+    CODE_SPAMMY: REVIEW,
+    CODE_SUPPRESSED: REVIEW,
+    CODE_UNAVAILABLE: Handle(retry=RETRY_UNAVAILABLE, then=REVIEW),
+    CODE_RATE_LIMITED: Handle(retry=RETRY_RATE_LIMITED, then=REVIEW),
+    CODE_AUTH: Handle(notify=True, retry=RETRY_ON_RECOVERY, then=REVIEW),
+    "*": REVIEW,
+}
+# Actions whose entry must never be sent to review: `lookup_subscriber` runs before there is a signup
+# entry (on Buttondown's webhook), and `create_issue_email` runs on a *published* issue — review would
+# take it off the site. Transient failures still retry (both are safe to repeat: a lookup is a read and
+# an issue email is created once per entry), then an admin is told instead.
+NO_REVIEW_POLICY: ErrorPolicy = {
+    CODE_UNAVAILABLE: Handle(retry=RETRY_UNAVAILABLE, then=Handle(notify=True)),
+    CODE_RATE_LIMITED: Handle(retry=RETRY_RATE_LIMITED, then=Handle(notify=True)),
+    CODE_AUTH: Handle(notify=True, retry=RETRY_ON_RECOVERY),
+    "*": FAIL,
+}
+# An admin runs `connect_webhooks` by hand and sees the error then and there: nothing to retry or review.
+ADMIN_POLICY: ErrorPolicy = {CODE_UNAVAILABLE: FAIL, CODE_RATE_LIMITED: FAIL, CODE_AUTH: FAIL, "*": FAIL}
 
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
@@ -92,20 +130,53 @@ def _error(resp: Response) -> tuple[str, str]:
     return "", resp.text[:ERROR_TEXT_LIMIT]
 
 
-class ButtondownError(ValueError):
-    """A readable failure with a stable ``code`` (blocked / spammy / suppressed / unknown).
+class ButtondownError(IntegrationError):
+    """A readable failure with a stable ``code`` (blocked / spammy / suppressed / auth / rate_limited /
+    unavailable / unknown) that selects its handling from ``error_policy``.
 
-    Still a ValueError, so Marvin fails the workflow step with the message; a Marvin that reads the
-    ``code`` hands it to the workflow's on-failure steps as ``${error.code}``."""
+    An ``IntegrationError``, so still a ValueError: an older Marvin fails the workflow step with the
+    message, and a workflow's on-failure steps read the code as ``${error.code}``."""
 
-    def __init__(self, message: str, code: str = CODE_UNKNOWN) -> None:
-        super().__init__(message)
-        self.code = code
+    def __init__(self, message: str, code: str = CODE_UNKNOWN, *, retry_after: float | None = None) -> None:
+        super().__init__(message, code=code, retry_after=retry_after)
+
+
+def _retry_after(resp: Response) -> float | None:
+    """Seconds from a ``Retry-After`` header — delta-seconds or an HTTP date — or None."""
+    value = next((str(v).strip() for k, v in (resp.headers or {}).items() if k.lower() == "retry-after"), "")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+def _status_code(status: int) -> str:
+    if status in (401, 403):
+        return CODE_AUTH
+    if status == 429:
+        return CODE_RATE_LIMITED
+    if status >= 500:
+        return CODE_UNAVAILABLE
+    return CODE_UNKNOWN
 
 
 def _fail(resp: Response, what: str) -> ButtondownError:
     code, detail = _error(resp)
-    return ButtondownError(f"Buttondown {what} failed: HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}")
+    status = _status_code(resp.status_code)
+    return ButtondownError(
+        f"Buttondown {what} failed: HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}",
+        status,
+        retry_after=_retry_after(resp) if status == CODE_RATE_LIMITED else None,
+    )
 
 
 def _same_url(a: str, b: str) -> bool:
@@ -131,6 +202,7 @@ class ButtondownProvider(IntegrationProvider):
     icon = "📮"
 
     content = CONTENT
+    error_policy: ClassVar[ErrorPolicy] = ERROR_POLICY
 
     # Buttondown signs with HMAC-SHA256 over the raw body: `X-Buttondown-Signature: sha256=<hex>`.
     # Its dashboard's *Test webhook* button sends unsigned, so a test delivery is rejected — real events are signed.
@@ -211,6 +283,7 @@ class ButtondownProvider(IntegrationProvider):
             },
             output_schema=_SUBSCRIBER_OUT,
             cost_hint="free",
+            error_policy=NO_REVIEW_POLICY,
         ),
         ProviderAction(
             key="create_issue_email",
@@ -246,6 +319,7 @@ class ButtondownProvider(IntegrationProvider):
                 "type": "object",
                 "properties": {"email_id": _STR, "status": _STR, "delivery": _STR, "skipped": {"type": "boolean"}, "reason": _STR, "url": _STR},
             },
+            error_policy=NO_REVIEW_POLICY,
         ),
         ProviderAction(
             key="connect_webhooks",
@@ -293,6 +367,7 @@ class ButtondownProvider(IntegrationProvider):
                     "legacy_removed": _BOOL,
                 },
             },
+            error_policy=ADMIN_POLICY,
         ),
     )
 
@@ -356,14 +431,16 @@ class ButtondownProvider(IntegrationProvider):
         if handler is None:
             raise NotImplementedError(f"buttondown has no action '{key}'")
         if not ctx.secret:
-            raise ValueError("No Buttondown API key configured.")
+            raise ButtondownError("No Buttondown API key configured.", CODE_AUTH)
         try:
             return handler(args or {}, ctx)
         except (ButtondownError, NotImplementedError):
             raise
         except ValueError as e:  # a bad argument or config: still readable, now with a code
             raise ButtondownError(str(e)) from e
-        except Exception as e:  # a network error must fail the step, not escape the workflow engine
+        except OSError as e:  # couldn't connect, or timed out (URLError, TimeoutError, ConnectionError…): try again later
+            raise ButtondownError(f"Buttondown {key} failed: {type(e).__name__}: {e}", CODE_UNAVAILABLE) from e
+        except Exception as e:  # anything else must still fail the step, not escape the workflow engine
             raise ButtondownError(f"Buttondown {key} failed: {type(e).__name__}: {e}") from e
 
     # ---- actions ----------------------------------------------------------------------------

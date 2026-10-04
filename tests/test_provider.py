@@ -6,10 +6,19 @@ import json
 import logging
 
 import pytest
-from marvin_integration_sdk import IntegrationContext, Response
+from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError, Response, Retry, register_provider, resolve_policy
 
 from marvin_integration_buttondown import ButtondownProvider
-from marvin_integration_buttondown.provider import CODE_BLOCKED, CODE_SPAMMY, CODE_SUPPRESSED, CODE_UNKNOWN, ButtondownError
+from marvin_integration_buttondown.provider import (
+    CODE_AUTH,
+    CODE_BLOCKED,
+    CODE_RATE_LIMITED,
+    CODE_SPAMMY,
+    CODE_SUPPRESSED,
+    CODE_UNAVAILABLE,
+    CODE_UNKNOWN,
+    ButtondownError,
+)
 
 API = "https://api.buttondown.com/v1"
 KEY = "bd-key"
@@ -28,9 +37,9 @@ class _Http:
 
     def _answer(self, method, url, body=None, data=None, headers=None):
         self.calls.append({"method": method, "url": url, "json": body, "data": data, "headers": headers})
-        for route_method, needle, status, payload in self.routes:
+        for route_method, needle, status, payload, *extra in self.routes:
             if route_method == method and needle in url:
-                return Response(status_code=status, content=json.dumps(payload).encode())
+                return Response(status_code=status, headers=extra[0] if extra else {}, content=json.dumps(payload).encode())
         return Response(status_code=599, content=b'{"detail":"no stub route"}')
 
     def get(self, url, *, headers=None, timeout=15):
@@ -373,22 +382,189 @@ def test_create_issue_email_rejects_a_bad_delivery_setting():
 def test_unknown_action_and_missing_key():
     with pytest.raises(NotImplementedError):
         _run(_Http([]), "nope")
-    with pytest.raises(ValueError, match="API key"):
+    with pytest.raises(ValueError, match="API key") as raised:
         ButtondownProvider().run_action("subscribe", {"email": "a@b.c"}, _ctx(_Http([]), secret=None))
+    assert raised.value.code == CODE_AUTH
 
 
 class _Offline(_Http):
-    def get(self, url, *, headers=None, timeout=15):
-        raise OSError("Network is unreachable")
+    error: Exception = OSError("Network is unreachable")
 
-    post = get
+    def _answer(self, *args, **kwargs):
+        raise self.error
 
 
-def test_a_network_error_fails_the_step_as_a_value_error_coded_unknown():
+class _TimingOut(_Offline):
+    error = TimeoutError("timed out")
+
+
+def test_a_network_error_fails_the_step_as_a_value_error_coded_unavailable():
     # Marvin's workflow engine turns only ValueError into a failed step; anything else escapes the run.
     with pytest.raises(ValueError, match="Buttondown lookup_subscriber failed: OSError: Network is unreachable") as raised:
         _run(_Offline([]), "lookup_subscriber", subscriber=SUB_ID)
+    assert raised.value.code == CODE_UNAVAILABLE
+
+
+def test_a_timeout_is_coded_unavailable():
+    with pytest.raises(ButtondownError, match="TimeoutError: timed out") as raised:
+        _run(_TimingOut([]), "subscribe", email="reader@example.com")
+    assert raised.value.code == CODE_UNAVAILABLE and raised.value.retry_after is None
+
+
+def test_any_other_exception_still_fails_the_step_coded_unknown():
+    class _Broken(_Offline):
+        error = RuntimeError("boom")
+
+    with pytest.raises(ButtondownError, match="RuntimeError: boom") as raised:
+        _run(_Broken([]), "subscribe", email="reader@example.com")
     assert raised.value.code == CODE_UNKNOWN
+
+
+# --- error codes from HTTP statuses -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (401, CODE_AUTH),
+        (403, CODE_AUTH),
+        (429, CODE_RATE_LIMITED),
+        (500, CODE_UNAVAILABLE),
+        (502, CODE_UNAVAILABLE),
+        (503, CODE_UNAVAILABLE),
+        (404, CODE_UNKNOWN),
+        (422, CODE_UNKNOWN),
+    ],
+)
+def test_http_failures_are_coded_by_status(status, code):
+    http = _Http([("POST", "/v1/subscribers", status, {"detail": "Nope."})])
+    with pytest.raises(ButtondownError, match=f"HTTP {status}: Nope.") as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    assert raised.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("key", "args", "route"),
+    [
+        ("lookup_subscriber", {"subscriber": SUB_ID}, ("GET", "/v1/subscribers/", 503, {"detail": "Down."})),
+        ("create_issue_email", {"subject": "Hi", "body": "x", "email_id": "em_1"}, ("GET", "/v1/emails/", 401, {"detail": "Invalid token."})),
+        (
+            "connect_webhooks",
+            {"webhook_url": "https://api.example.com/api/hooks/tok", "signing_key": "k"},
+            ("GET", "/v1/webhooks", 429, {"detail": "Slow."}),
+        ),
+    ],
+)
+def test_every_action_codes_its_http_failures(key, args, route):
+    with pytest.raises(ButtondownError) as raised:
+        _run(_Http([route]), key, **args)
+    assert raised.value.code == {503: CODE_UNAVAILABLE, 401: CODE_AUTH, 429: CODE_RATE_LIMITED}[route[2]]
+
+
+@pytest.mark.parametrize(("header", "expected"), [("Retry-After", 30.0), ("retry-after", 30.0), ("RETRY-AFTER", 30.0)])
+def test_rate_limited_carries_retry_after_seconds(header, expected):
+    http = _Http([("POST", "/v1/subscribers", 429, {"code": "rate_limited", "detail": "Slow down."}, {header: "30"})])
+    with pytest.raises(ButtondownError, match="HTTP 429 rate_limited: Slow down.") as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    assert raised.value.code == CODE_RATE_LIMITED and raised.value.retry_after == expected
+
+
+def test_rate_limited_reads_an_http_date_retry_after():
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    when = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
+    http = _Http([("POST", "/v1/subscribers", 429, {"detail": "Slow down."}, {"Retry-After": when})])
+    with pytest.raises(ButtondownError) as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    assert 100 <= raised.value.retry_after <= 120
+
+
+@pytest.mark.parametrize("value", [None, "", "soon", "Mon, 01 Jan 2001 00:00:00 GMT", "-5"])
+def test_rate_limited_without_a_usable_retry_after(value):
+    headers = {} if value is None else {"Retry-After": value}
+    http = _Http([("POST", "/v1/subscribers", 429, {"detail": "Slow down."}, headers)])
+    with pytest.raises(ButtondownError) as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    # A missing or garbled hint leaves the policy's backoff in charge; a past date or negative means "now".
+    assert raised.value.code == CODE_RATE_LIMITED
+    assert raised.value.retry_after == {None: None, "": None, "soon": None}.get(value, 0.0)
+
+
+def test_retry_after_is_only_read_for_a_rate_limit():
+    http = _Http([("POST", "/v1/subscribers", 503, {"detail": "Down."}, {"Retry-After": "30"})])
+    with pytest.raises(ButtondownError) as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    assert raised.value.code == CODE_UNAVAILABLE and raised.value.retry_after is None
+
+
+def test_a_coded_error_is_an_integration_error_that_survives_pickling():
+    import pickle
+
+    error = ButtondownError("Slow down.", CODE_RATE_LIMITED, retry_after=30.0)
+    assert isinstance(error, IntegrationError) and isinstance(error, ValueError)
+    copy = pickle.loads(pickle.dumps(error))
+    assert (type(copy), str(copy), copy.code, copy.retry_after) == (ButtondownError, "Slow down.", CODE_RATE_LIMITED, 30.0)
+
+
+# --- error policy -----------------------------------------------------------------------------------
+
+REVIEW = Handle(review=True)
+NOTIFY = Handle(notify=True)
+
+
+def test_register_provider_accepts_the_error_policy():
+    assert register_provider(ButtondownProvider) is ButtondownProvider
+
+
+def test_info_shows_how_each_error_is_handled():
+    policy = ButtondownProvider().info()["error_policy"]
+    assert set(policy["provider"]) == {CODE_BLOCKED, CODE_SPAMMY, CODE_SUPPRESSED, CODE_UNAVAILABLE, CODE_RATE_LIMITED, CODE_AUTH, "*"}
+    assert policy["provider"][CODE_UNAVAILABLE]["summary"] == "retry 3× (2m, 10m, 1h), then send to review"
+    assert policy["provider"][CODE_RATE_LIMITED]["summary"] == "retry 3× (1m, 5m, 15m), then send to review"
+    assert policy["provider"][CODE_AUTH]["summary"] == "notify admins, wait for the connection to recover, then retry once, then send to review"
+    assert policy["provider"][CODE_BLOCKED]["summary"] == policy["provider"]["*"]["summary"] == "send to review"
+    assert set(policy["actions"]) == {"subscribe", "lookup_subscriber", "create_issue_email", "connect_webhooks"}
+    assert policy["actions"]["subscribe"] == {}  # the signup follows the provider's policy
+
+
+@pytest.mark.parametrize(
+    ("code", "handle"),
+    [
+        (CODE_BLOCKED, REVIEW),
+        (CODE_SPAMMY, REVIEW),
+        (CODE_SUPPRESSED, REVIEW),
+        (CODE_UNAVAILABLE, Handle(retry=Retry(backoff=(120, 600, 3600)), then=REVIEW)),
+        (CODE_RATE_LIMITED, Handle(retry=Retry(backoff=(60, 300, 900)), then=REVIEW)),
+        (CODE_AUTH, Handle(notify=True, retry=Retry(backoff=(), on_recovery=True), then=REVIEW)),
+        (CODE_UNKNOWN, REVIEW),
+        ("something_new", REVIEW),
+    ],
+)
+def test_a_failed_signup_is_handled_by_the_provider_policy(code, handle):
+    assert resolve_policy(ButtondownProvider, "subscribe", code) == handle
+
+
+@pytest.mark.parametrize("action", ["lookup_subscriber", "create_issue_email"])
+@pytest.mark.parametrize(
+    ("code", "handle"),
+    [
+        (CODE_UNAVAILABLE, Handle(retry=Retry(backoff=(120, 600, 3600)), then=NOTIFY)),
+        (CODE_RATE_LIMITED, Handle(retry=Retry(backoff=(60, 300, 900)), then=NOTIFY)),
+        (CODE_AUTH, Handle(notify=True, retry=Retry(backoff=(), on_recovery=True))),
+        (CODE_UNKNOWN, Handle()),
+    ],
+)
+def test_lookups_and_issue_emails_retry_but_never_send_an_entry_to_review(action, code, handle):
+    # lookup_subscriber runs before there is a signup entry; create_issue_email's entry is a published issue.
+    resolved = resolve_policy(ButtondownProvider, action, code)
+    assert resolved == handle
+    assert not resolved.review and not (resolved.then and resolved.then.review)
+
+
+@pytest.mark.parametrize("code", [CODE_UNAVAILABLE, CODE_RATE_LIMITED, CODE_AUTH, CODE_UNKNOWN])
+def test_connect_webhooks_just_fails_for_the_admin_who_ran_it(code):
+    assert resolve_policy(ButtondownProvider, "connect_webhooks", code) == Handle()
 
 
 def test_declared_actions_match_the_handlers():

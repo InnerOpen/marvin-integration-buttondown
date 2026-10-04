@@ -3,6 +3,7 @@
 import re
 
 import pytest
+from marvin_integration_sdk import Handle, resolve_policy
 
 from marvin_integration_buttondown import ButtondownProvider
 from marvin_integration_buttondown.content import (
@@ -15,7 +16,14 @@ from marvin_integration_buttondown.content import (
     UNSUBSCRIBED,
     UNSUBSCRIBED_READERS,
 )
-from marvin_integration_buttondown.provider import CODE_BLOCKED, CODE_SUPPRESSED, WEBHOOK_EVENTS, ButtondownError
+from marvin_integration_buttondown.provider import (
+    CODE_AUTH,
+    CODE_RATE_LIMITED,
+    CODE_UNAVAILABLE,
+    CODE_UNKNOWN,
+    WEBHOOK_EVENTS,
+    ButtondownError,
+)
 
 ACTION_KEYS = {a.key for a in ButtondownProvider.actions}
 WORKFLOWS = [b for b in CONTENT if b.kind == "workflow"]
@@ -181,30 +189,11 @@ def test_issue_workflow_creates_the_email_once_and_records_its_id():
 
 
 # --- a refused signup goes to Needs review ------------------------------------------------------------
-# Marvin runs a workflow's `on_failure` steps when a step fails, with the failure as `${error.*}`. These
-# tests resolve the declared steps the way Marvin's templates do, against the error the provider raises
-# for a stubbed Buttondown refusal (Marvin prefixes the step: "buttondown.subscribe failed: …").
+# The provider's error policy does it now (Marvin applies it and records `integration_error.buttondown`
+# on the entry); the workflow declares no on_failure steps of its own.
 
-_TEMPLATE = re.compile(r"\$\{([^}]+)\}")
-
-
-def _resolve(value, context):
-    """Marvin's `${path}` templates: a whole-string template keeps the value's type, embedded ones become text."""
-    if isinstance(value, dict):
-        return {k: _resolve(v, context) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_resolve(v, context) for v in value]
-    if not isinstance(value, str):
-        return value
-
-    def lookup(path):
-        node = context
-        for part in path.split("."):
-            node = node.get(part) if isinstance(node, dict) else None
-        return node
-
-    whole = _TEMPLATE.fullmatch(value)
-    return lookup(whole.group(1)) if whole else _TEMPLATE.sub(lambda m: str(lookup(m.group(1)) or ""), value)
+# What any action can fail with; the refusals (blocked / spammy / suppressed) come only from subscribe.
+CALL_CODES = (CODE_AUTH, CODE_RATE_LIMITED, CODE_UNAVAILABLE, CODE_UNKNOWN)
 
 
 def _refusal(buttondown_code: str) -> ButtondownError:
@@ -216,37 +205,25 @@ def _refusal(buttondown_code: str) -> ButtondownError:
     return raised.value
 
 
-def _on_failure_for(error: ButtondownError):
-    """The signup workflow's on-failure steps, resolved for a failed subscribe step."""
-    context = {
-        "error": {"message": f"buttondown.subscribe failed: {error}", "code": error.code, "step": "subscribe", "at": "2026-10-04T10:00:00+00:00"}
-    }
-    return _resolve(_definition(SUBSCRIBE_ON_SIGNUP)["on_failure"], context)
+def _integration_steps(blueprint):
+    return [step for step in _steps(blueprint) if step["kind"] == "integration"]
 
 
-def test_a_blocked_signup_records_the_error_and_goes_to_needs_review_with_the_reason():
-    record, review = _on_failure_for(_refusal("subscriber_blocked"))
-
-    assert record["op"] == "set_metadata"
-    error = record["metadata"]["buttondown_subscribe_error"]
-    assert (error["code"], error["at"]) == (CODE_BLOCKED, "2026-10-04T10:00:00+00:00")
-    assert "spam firewall refused reader@example.com" in error["message"]
-    assert review["op"] == "request_review" and "spam firewall refused reader@example.com" in review["reason"]
+def test_no_workflow_declares_on_failure_steps():
+    assert [b.slug for b in WORKFLOWS if "on_failure" in _definition(b)] == []
 
 
-def test_a_suppressed_signup_goes_to_needs_review_saying_to_re_add_them_in_buttondown():
-    record, review = _on_failure_for(_refusal("subscriber_suppressed"))
-
-    assert record["metadata"]["buttondown_subscribe_error"]["code"] == CODE_SUPPRESSED
-    assert review["op"] == "request_review"
-    assert "unsubscribed from this newsletter before" in review["reason"] and "re-add them in Buttondown" in review["reason"]
-
-
-def test_the_failure_steps_act_on_the_signup_entry_itself():
-    # No entity_* target: they act on the triggering entry, the signup the subscribe step failed for.
-    for step in _definition(SUBSCRIBE_ON_SIGNUP)["on_failure"]:
-        assert step["kind"] == "entry" and not {"entity_id", "entity_slug", "entity_query"} & step.keys()
+@pytest.mark.parametrize("buttondown_code", ["subscriber_blocked", "email_blocked", "ip_address_spammy", "subscriber_suppressed"])
+def test_a_refused_signup_goes_to_needs_review_through_the_provider_policy(buttondown_code):
+    (subscribe,) = _integration_steps(SUBSCRIBE_ON_SIGNUP)
+    error = _refusal(buttondown_code)
+    assert resolve_policy(ButtondownProvider, subscribe["action"], error.code) == Handle(review=True)
 
 
-def test_only_the_signup_workflow_sends_failures_to_review():
-    assert [b.slug for b in CONTENT if b.kind == "workflow" and "on_failure" in _definition(b)] == [SUBSCRIBE_ON_SIGNUP.slug]
+@pytest.mark.parametrize("blueprint", [CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH], ids=lambda b: b.slug)
+def test_the_other_workflows_never_send_their_entry_to_review(blueprint):
+    # A subscriber event has no signup entry yet when its lookup fails; an issue is published — review would unpublish it.
+    for step in _integration_steps(blueprint):
+        for code in CALL_CODES:
+            handle = resolve_policy(ButtondownProvider, step["action"], code)
+            assert handle is not None and not handle.review and not (handle.then and handle.then.review), (step["action"], code)

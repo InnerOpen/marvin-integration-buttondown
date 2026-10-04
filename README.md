@@ -30,19 +30,39 @@ if the key is rejected or the config is invalid.
 | `create_issue_email` | `subject`, `body` (Markdown), `description` (preview text), `canonical_url`, `entry_id`, `email_id`, `site_url`. Follows **Issue delivery**. `canonical_url` (the workflow passes `${entry.url}`, the issue's page on your site) is sent to Buttondown when it is, or can be made, absolute; otherwise it is left out. Runs once per entry: if `email_id` (the entry's stored `buttondown_email_id`) still exists in Buttondown, or an email carries `metadata.marvin_entry_id` for this entry, that email is returned with `skipped: true` and no second email is made. The body is sent with Buttondown's Markdown editor-mode marker. Every create names its status, because Buttondown's own default is `about_to_send` (send). |
 | `connect_webhooks` | **Connect Buttondown webhooks.** Creates or updates the Buttondown webhook that posts this workspace's `subscriber.confirmed` and `subscriber.unsubscribed` events to Marvin: enabled, signed with `signing_key`. Args: `webhook_url` (this workspace's `buttondown` incoming webhook URL), `signing_key: {{BUTTONDOWN_SIGNING_KEY}}`, optional `remove_legacy_url` (an old Marvin hook URL to retire), optional `label` (e.g. the workspace name, shown in Buttondown's description). Safe to run again. The webhook already pointing at `webhook_url` is updated, not duplicated, and extra copies on that URL are removed. Webhooks pointing anywhere else are never touched. `remove_legacy_url` deletes only a webhook whose URL matches it exactly (a trailing slash aside), and it must be a Marvin hook URL. Returns `webhook_id`, `result` (`created` / `updated` / `replaced` / `unchanged`), `removed`, `legacy_removed`. |
 
-Every failure, network errors included, raises a readable error, so the workflow step fails visibly.
-Each error also carries a stable `code` that a workflow's on-failure steps read as `${error.code}`:
-
-| `code` | When |
-|---|---|
-| `blocked` | The spam firewall refused the address (`subscriber_blocked`, `email_blocked`). |
-| `spammy` | The spam firewall refused the visitor's IP (`ip_address_spammy`). |
-| `suppressed` | The address unsubscribed before (`subscriber_suppressed`); only Buttondown can re-add it. |
-| `unknown` | Anything else: another HTTP error, the network, a bad argument or a missing API key. |
-
 It also contributes the **`buttondown`** webhook signature scheme: HMAC-SHA256 of the raw body, hex, in
 `X-Buttondown-Signature: sha256=<hex>` (as Buttondown's docs describe). Buttondown's **Test webhook**
 button sends *unsigned* requests, so Marvin rejects those with a 401. Real events are signed.
+
+## Errors and how they're handled
+
+Every failure, network errors included, raises a readable `ButtondownError` (an SDK `IntegrationError`)
+with a stable `code`. The provider declares an **error policy** saying what Marvin does about each code;
+Marvin applies it (retries, Needs review, admin alerts) and shows it on the integration's card under
+"How errors are handled". The provider itself never sleeps, retries or alerts. A workflow's own
+on-failure steps still see the code as `${error.code}`.
+
+| `code` | When | `subscribe` (provider policy) |
+|---|---|---|
+| `blocked` | The spam firewall refused the address (`subscriber_blocked`, `email_blocked`). | Send to review. |
+| `spammy` | The spam firewall refused the visitor's IP (`ip_address_spammy`). | Send to review. |
+| `suppressed` | The address unsubscribed before (`subscriber_suppressed`); only Buttondown can re-add it. | Send to review. |
+| `unavailable` | Buttondown couldn't be reached or timed out, or answered 5xx. | Retry 3× (2m, 10m, 1h), then send to review. |
+| `rate_limited` | Buttondown answered 429. Its `Retry-After` (seconds or an HTTP date) becomes the error's `retry_after`, which Marvin honours over the backoff. | Retry 3× (1m, 5m, 15m), then send to review. |
+| `auth` | No API key on the connection, or Buttondown rejected it (401/403). | Notify admins, wait until the connection is healthy again, retry once, then send to review. |
+| `unknown` | Anything else: another HTTP error, a bad argument or setting. | Send to review (the `*` fallback). |
+
+"Send to review" moves the signup entry to **Needs review** with the error message as its reason, and
+Marvin records the failure on the entry as `integration_error.buttondown`, so the workflow needs no
+on-failure steps of its own.
+
+Some actions override the provider policy, because sending their entry to review would be wrong:
+
+| Action | Policy | Why |
+|---|---|---|
+| `lookup_subscriber` | `unavailable` / `rate_limited`: the same retries, then notify admins. `auth`: notify, retry once on recovery, then fail. Anything else: fail. | It runs on Buttondown's webhook before there is a signup entry to review. Retrying a read is free and keeps a confirm or unsubscribe from being lost; a subscriber that doesn't exist is just a failed run. |
+| `create_issue_email` | The same as `lookup_subscriber`. | Its entry is a *published* issue, and review would take it off the site. Retries are safe: the email is created once per entry, so a retry after a timeout finds the email instead of making (or sending) a second one. |
+| `connect_webhooks` | Every code: fail. | An admin runs it by hand from the card and sees the error right there. Nothing to retry or review. |
 
 ## What a workspace gets — declared, applied from the integration's card
 
@@ -52,7 +72,7 @@ switched off, and each can stay off on its own. The two collections are optional
 | Kind | Slug | What it does |
 |---|---|---|
 | incoming webhook | `buttondown` | Where Buttondown posts subscriber events (scheme `buttondown`, secret `BUTTONDOWN_SIGNING_KEY`). |
-| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails** (on-failure steps): `set_metadata buttondown_subscribe_error` (`{code, message, at}`) → `request_review` with the error as the reason, so the entry moves to **Needs review**. |
+| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails**, the error policy above applies: a refusal goes straight to **Needs review** with the reason; an outage or rate limit is retried first. |
 | workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
@@ -129,11 +149,11 @@ A workspace without either collection just applies them.
 ## Known limits
 
 - A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id, the step fails rather than guess.
-- **A refused signup goes to Needs review; nothing retries it.** When Buttondown refuses an address, or the call fails, the signup workflow's run fails (it shows under **Runs** and as a failed-workflow toast), and its on-failure steps record `buttondown_subscribe_error` on the entry and move it to **Needs review** with the reason. The Review Queue's card shows the reason. Look at the entry: a firewall refusal (`blocked` / `spammy`) is usually spam you can archive; a real reader can be added by hand in Buttondown. An `unknown` failure (Buttondown down, a bad key) is worth fixing and re-adding the same way.
+- **A refused signup goes to Needs review; a refusal is never retried.** When Buttondown refuses an address, the signup workflow's run fails (it shows under **Runs**) and the error policy moves the entry to **Needs review** with the reason, which the Review Queue's card shows. Look at the entry: a firewall refusal (`blocked` / `spammy`) is usually spam you can archive; a real reader can be added by hand in Buttondown. Only an outage, a rate limit or a rejected key is retried (see the table above); an `unknown` failure goes to review straight away.
 - **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed`, the run fails and the entry goes to Needs review with code `suppressed`. To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
 - Updating a Buttondown webhook in place needs a Marvin whose integration HTTP helper has PATCH. On an older Marvin, `connect_webhooks` replaces the webhook instead: it creates the new one, then deletes the old one (`result: replaced`). The outcome is the same, but the webhook gets a new id.
-- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The signup workflow's on-failure steps (and `request_review`) need the release after 1.0.0-rc.192; an older Marvin ignores them, so a refused signup stays in the inbox.
-- **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow before keeps the old one. The integration's card marks it with **↑** and an **Update** button; click it to get the on-failure steps (whether it's switched on is kept). Do this once Marvin has the release above.
+- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox.
+- **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
 ## Develop
 

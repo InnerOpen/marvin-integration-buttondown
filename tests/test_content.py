@@ -1,5 +1,9 @@
 """Declared content: the webhook and workflows a workspace applies from the integration's card."""
 
+import re
+
+import pytest
+
 from marvin_integration_buttondown import ButtondownProvider
 from marvin_integration_buttondown.content import (
     CONFIRMED,
@@ -11,7 +15,7 @@ from marvin_integration_buttondown.content import (
     UNSUBSCRIBED,
     UNSUBSCRIBED_COLLECTION,
 )
-from marvin_integration_buttondown.provider import WEBHOOK_EVENTS
+from marvin_integration_buttondown.provider import CODE_BLOCKED, CODE_SUPPRESSED, WEBHOOK_EVENTS, ButtondownError
 
 ACTION_KEYS = {a.key for a in ButtondownProvider.actions}
 
@@ -121,3 +125,75 @@ def test_issue_workflow_creates_the_email_once_and_records_its_id():
     assert record["metadata"]["buttondown_email_id"] == "${steps.issue.output.email_id}"
     # Never blank, so the step succeeds when delivery is off and there is no email id.
     assert record["metadata"]["buttondown_issue_delivery"] == "${steps.issue.output.delivery}"
+
+
+# --- a refused signup goes to Needs review ------------------------------------------------------------
+# Marvin runs a workflow's `on_failure` steps when a step fails, with the failure as `${error.*}`. These
+# tests resolve the declared steps the way Marvin's templates do, against the error the provider raises
+# for a stubbed Buttondown refusal (Marvin prefixes the step: "buttondown.subscribe failed: …").
+
+_TEMPLATE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _resolve(value, context):
+    """Marvin's `${path}` templates: a whole-string template keeps the value's type, embedded ones become text."""
+    if isinstance(value, dict):
+        return {k: _resolve(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve(v, context) for v in value]
+    if not isinstance(value, str):
+        return value
+
+    def lookup(path):
+        node = context
+        for part in path.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        return node
+
+    whole = _TEMPLATE.fullmatch(value)
+    return lookup(whole.group(1)) if whole else _TEMPLATE.sub(lambda m: str(lookup(m.group(1)) or ""), value)
+
+
+def _refusal(buttondown_code: str) -> ButtondownError:
+    from test_provider import _Http, _run
+
+    http = _Http([("POST", "/v1/subscribers", 400, {"code": buttondown_code, "detail": "Refused."})])
+    with pytest.raises(ButtondownError) as raised:
+        _run(http, "subscribe", email="reader@example.com")
+    return raised.value
+
+
+def _on_failure_for(error: ButtondownError):
+    """The signup workflow's on-failure steps, resolved for a failed subscribe step."""
+    context = {
+        "error": {"message": f"buttondown.subscribe failed: {error}", "code": error.code, "step": "subscribe", "at": "2026-10-04T10:00:00+00:00"}
+    }
+    return _resolve(_definition(SUBSCRIBE_ON_SIGNUP)["on_failure"], context)
+
+
+def test_a_blocked_signup_records_the_error_and_goes_to_needs_review_with_the_reason():
+    record, review = _on_failure_for(_refusal("subscriber_blocked"))
+
+    assert record["op"] == "set_metadata"
+    error = record["metadata"]["buttondown_subscribe_error"]
+    assert (error["code"], error["at"]) == (CODE_BLOCKED, "2026-10-04T10:00:00+00:00")
+    assert "spam firewall refused reader@example.com" in error["message"]
+    assert review["op"] == "request_review" and "spam firewall refused reader@example.com" in review["reason"]
+
+
+def test_a_suppressed_signup_goes_to_needs_review_saying_to_re_add_them_in_buttondown():
+    record, review = _on_failure_for(_refusal("subscriber_suppressed"))
+
+    assert record["metadata"]["buttondown_subscribe_error"]["code"] == CODE_SUPPRESSED
+    assert review["op"] == "request_review"
+    assert "unsubscribed from this newsletter before" in review["reason"] and "re-add them in Buttondown" in review["reason"]
+
+
+def test_the_failure_steps_act_on_the_signup_entry_itself():
+    # No entity_* target: they act on the triggering entry, the signup the subscribe step failed for.
+    for step in _definition(SUBSCRIBE_ON_SIGNUP)["on_failure"]:
+        assert step["kind"] == "entry" and not {"entity_id", "entity_slug", "entity_query"} & step.keys()
+
+
+def test_only_the_signup_workflow_sends_failures_to_review():
+    assert [b.slug for b in CONTENT if b.kind == "workflow" and "on_failure" in _definition(b)] == [SUBSCRIBE_ON_SIGNUP.slug]

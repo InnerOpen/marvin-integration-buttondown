@@ -9,6 +9,7 @@ import pytest
 from marvin_integration_sdk import IntegrationContext, Response
 
 from marvin_integration_buttondown import ButtondownProvider
+from marvin_integration_buttondown.provider import CODE_BLOCKED, CODE_SPAMMY, CODE_SUPPRESSED, CODE_UNKNOWN, ButtondownError
 
 API = "https://api.buttondown.com/v1"
 KEY = "bd-key"
@@ -157,27 +158,46 @@ def test_subscribe_a_reminder_network_error_does_not_fail_the_signup():
     assert out["confirmation_resent"] is False and "Network is unreachable" in out["confirmation_reason"]
 
 
-def test_subscribe_blocked_by_the_spam_firewall_is_a_readable_error():
-    http = _Http([("POST", "/v1/subscribers", 400, {"code": "subscriber_blocked", "detail": "This subscriber was blocked by the firewall."})])
-    with pytest.raises(ValueError, match="spam firewall refused reader@example.com"):
-        _run(http, "subscribe", email="reader@example.com")
+def _refused(code: str, detail: str = "Refused.") -> _Http:
+    return _Http([("POST", "/v1/subscribers", 400, {"code": code, "detail": detail})])
 
 
-def test_subscribe_a_suppressed_address_explains_the_earlier_unsubscribe():
-    http = _Http([("POST", "/v1/subscribers", 400, {"code": "subscriber_suppressed", "detail": "Suppressed."})])
-    with pytest.raises(ValueError, match="unsubscribed from this newsletter before"):
-        _run(http, "subscribe", email="reader@example.com")
+def test_subscribe_blocked_by_the_spam_firewall_is_a_readable_error_coded_blocked():
+    with pytest.raises(ButtondownError, match="spam firewall refused reader@example.com") as raised:
+        _run(_refused("subscriber_blocked", "This subscriber was blocked by the firewall."), "subscribe", email="reader@example.com")
+    assert raised.value.code == CODE_BLOCKED
 
 
-def test_subscribe_other_errors_carry_status_code_and_detail():
+@pytest.mark.parametrize(("buttondown_code", "code"), [("email_blocked", CODE_BLOCKED), ("ip_address_spammy", CODE_SPAMMY)])
+def test_subscribe_other_firewall_refusals_carry_their_code(buttondown_code, code):
+    with pytest.raises(ButtondownError, match=f"spam firewall refused reader@example.com \\({buttondown_code}\\)") as raised:
+        _run(_refused(buttondown_code), "subscribe", email="reader@example.com")
+    assert raised.value.code == code
+
+
+def test_subscribe_a_suppressed_address_explains_the_earlier_unsubscribe_and_how_to_re_add_it():
+    with pytest.raises(ButtondownError, match="unsubscribed from this newsletter before") as raised:
+        _run(_refused("subscriber_suppressed", "Suppressed."), "subscribe", email="reader@example.com")
+    assert raised.value.code == CODE_SUPPRESSED
+    assert "re-add them in Buttondown" in str(raised.value)
+
+
+def test_subscribe_other_errors_carry_status_code_and_detail_coded_unknown():
     http = _Http([("POST", "/v1/subscribers", 422, {"detail": [{"loc": ["body", "email_address"], "msg": "value is not a valid email"}]})])
-    with pytest.raises(ValueError, match="HTTP 422: value is not a valid email"):
+    with pytest.raises(ButtondownError, match="HTTP 422: value is not a valid email") as raised:
         _run(http, "subscribe", email="x@y")
+    assert raised.value.code == CODE_UNKNOWN
 
 
-def test_subscribe_needs_an_email():
-    with pytest.raises(ValueError, match="email address"):
+def test_subscribe_needs_an_email_coded_unknown():
+    with pytest.raises(ButtondownError, match="email address") as raised:
         _run(_Http([]), "subscribe", email="${event.submission_data.email}")
+    assert raised.value.code == CODE_UNKNOWN
+
+
+def test_a_coded_error_is_still_a_value_error_for_older_marvins():
+    with pytest.raises(ValueError):
+        _run(_refused("subscriber_blocked"), "subscribe", email="reader@example.com")
 
 
 # --- lookup_subscriber ------------------------------------------------------------------------------
@@ -364,10 +384,11 @@ class _Offline(_Http):
     post = get
 
 
-def test_a_network_error_fails_the_step_as_a_value_error():
+def test_a_network_error_fails_the_step_as_a_value_error_coded_unknown():
     # Marvin's workflow engine turns only ValueError into a failed step; anything else escapes the run.
-    with pytest.raises(ValueError, match="Buttondown lookup_subscriber failed: OSError: Network is unreachable"):
+    with pytest.raises(ValueError, match="Buttondown lookup_subscriber failed: OSError: Network is unreachable") as raised:
         _run(_Offline([]), "lookup_subscriber", subscriber=SUB_ID)
+    assert raised.value.code == CODE_UNKNOWN
 
 
 def test_declared_actions_match_the_handlers():

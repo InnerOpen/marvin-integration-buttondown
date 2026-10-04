@@ -13,7 +13,8 @@ Buttondown quirks this hides:
 - ``POST /emails`` defaults to ``status: about_to_send`` — an email created without a status is sent.
   Every create here names its status explicitly.
 - Signups can be refused by Buttondown's spam firewall (``400 subscriber_blocked``) or because the
-  address unsubscribed before (``subscriber_suppressed``); both come back as readable errors.
+  address unsubscribed before (``subscriber_suppressed``); both come back as readable errors with a
+  stable ``code`` (see :class:`ButtondownError`) that the signup workflow's on-failure steps record.
 - Re-subscribing an address that never confirmed (``unactivated``) is refused as "already exists" and
   sends nothing, so ``subscribe`` asks for a confirmation reminder (``POST /subscribers/{id}/send-reminder``).
 - Webhooks are account-wide, and several Marvin workspaces can share one Buttondown account. Each
@@ -52,7 +53,13 @@ ENTRY_METADATA_KEY = "marvin_entry_id"
 
 ALREADY_SUBSCRIBED = {"email_already_exists", "subscriber_already_exists"}
 UNACTIVATED = "unactivated"
-FIREWALLED = {"subscriber_blocked", "email_blocked", "ip_address_spammy"}
+# The stable codes a failure carries (ButtondownError.code), for a workflow's on-failure steps to record
+# or branch on — Buttondown's own codes, folded to what a person does about them.
+CODE_BLOCKED = "blocked"  # the spam firewall refused the address (subscriber_blocked / email_blocked)
+CODE_SPAMMY = "spammy"  # …or the visitor's IP (ip_address_spammy)
+CODE_SUPPRESSED = "suppressed"  # the address unsubscribed before; only Buttondown can re-add it
+CODE_UNKNOWN = "unknown"  # anything else: an HTTP error, the network, a bad argument
+REFUSAL_CODES = {"subscriber_blocked": CODE_BLOCKED, "email_blocked": CODE_BLOCKED, "ip_address_spammy": CODE_SPAMMY}
 
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
@@ -85,9 +92,20 @@ def _error(resp: Response) -> tuple[str, str]:
     return "", resp.text[:ERROR_TEXT_LIMIT]
 
 
-def _fail(resp: Response, what: str) -> ValueError:
+class ButtondownError(ValueError):
+    """A readable failure with a stable ``code`` (blocked / spammy / suppressed / unknown).
+
+    Still a ValueError, so Marvin fails the workflow step with the message; a Marvin that reads the
+    ``code`` hands it to the workflow's on-failure steps as ``${error.code}``."""
+
+    def __init__(self, message: str, code: str = CODE_UNKNOWN) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _fail(resp: Response, what: str) -> ButtondownError:
     code, detail = _error(resp)
-    return ValueError(f"Buttondown {what} failed: HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}")
+    return ButtondownError(f"Buttondown {what} failed: HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}")
 
 
 def _same_url(a: str, b: str) -> bool:
@@ -341,10 +359,12 @@ class ButtondownProvider(IntegrationProvider):
             raise ValueError("No Buttondown API key configured.")
         try:
             return handler(args or {}, ctx)
-        except (ValueError, NotImplementedError):
+        except (ButtondownError, NotImplementedError):
             raise
+        except ValueError as e:  # a bad argument or config: still readable, now with a code
+            raise ButtondownError(str(e)) from e
         except Exception as e:  # a network error must fail the step, not escape the workflow engine
-            raise ValueError(f"Buttondown {key} failed: {type(e).__name__}: {e}") from e
+            raise ButtondownError(f"Buttondown {key} failed: {type(e).__name__}: {e}") from e
 
     # ---- actions ----------------------------------------------------------------------------
 
@@ -373,10 +393,14 @@ class ButtondownProvider(IntegrationProvider):
                 if out["type"] == UNACTIVATED:
                     out.update(self._resend_confirmation(ctx, out["subscriber_id"] or email))
                 return out
-        if code in FIREWALLED:
-            raise ValueError(f"Buttondown's spam firewall refused {email} ({code}): {detail}")
+        if code in REFUSAL_CODES:  # the spam firewall
+            raise ButtondownError(f"Buttondown's spam firewall refused {email} ({code}): {detail}", REFUSAL_CODES[code])
         if code == "subscriber_suppressed":
-            raise ValueError(f"{email} unsubscribed from this newsletter before, so Buttondown won't re-add it from a signup ({code}): {detail}")
+            raise ButtondownError(
+                f"{email} unsubscribed from this newsletter before, so Buttondown won't re-add it from a signup — "
+                f"if they want back in, re-add them in Buttondown ({code}): {detail}",
+                CODE_SUPPRESSED,
+            )
         raise _fail(resp, "subscribe")
 
     def _resend_confirmation(self, ctx: IntegrationContext, key: str) -> dict:

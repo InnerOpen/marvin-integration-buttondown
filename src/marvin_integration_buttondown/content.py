@@ -11,13 +11,17 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   → the reader confirms → Buttondown posts `subscriber.confirmed` → `lookup_subscriber` turns the
   webhook's UUID into the API id → the entry with that id is published. `subscriber.unsubscribed`
   archives it the same way. A reader with no signup entry here (subscribed elsewhere) is skipped.
+  A signup Buttondown refuses (spam firewall, an earlier unsubscribe) or that fails otherwise goes to
+  Needs review instead of waiting in the inbox like a pending one: the subscribe workflow's on-failure
+  steps record `buttondown_subscribe_error` ({code, message, at}) and the reason on the entry.
   Publishing a `newsletter-issue` entry → `create_issue_email` (draft by default; see the connection's
   Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
   `buttondown_email_id`, so a republish never makes a second email.
 
 Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
 step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
-signup entry fails the step).
+signup entry fails the step). The on-failure steps need the release after rc.191; an older Marvin
+ignores them (the run fails and the entry stays in the inbox, as before).
 
 Parameters: `integration` (this integration's slug in the workspace, default `buttondown`),
 `signup_type` (the signup form's entry type, default `newsletter`) and `issue_type` (the issue
@@ -62,6 +66,7 @@ COLLECTION_PARAM = {
 }
 
 SUBSCRIBER_ID_KEY = "buttondown_subscriber_id"
+SUBSCRIBE_ERROR_KEY = "buttondown_subscribe_error"
 EMAIL_ID_KEY = "buttondown_email_id"
 DELIVERY_KEY = "buttondown_issue_delivery"
 
@@ -87,7 +92,10 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
     kind="workflow",
     slug="buttondown-subscribe-on-signup",
     name="Buttondown: subscribe on signup",
-    description="When the site's newsletter form is submitted (and not flagged as spam), add the address to Buttondown and remember its subscriber id on the entry.",
+    description=(
+        "When the site's newsletter form is submitted (and not flagged as spam), add the address to Buttondown and remember its subscriber id "
+        "on the entry. If Buttondown refuses it, the entry goes to Needs review with the reason."
+    ),
     required=True,
     category=CATEGORY,
     parameters=(SIGNUP_TYPE_PARAM, INTEGRATION_PARAM),
@@ -112,6 +120,17 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
                     },
                 },
                 {"kind": "entry", "op": "set_metadata", "metadata": {SUBSCRIBER_ID_KEY: "${steps.subscribe.output.subscriber_id}"}},
+            ],
+            # Buttondown refused the address (or the call failed): say so on the entry and send it to Needs
+            # review, so it doesn't wait in the inbox looking pending. `code` is blocked / spammy /
+            # suppressed / unknown; the message says what to do (a suppressed reader is re-added in Buttondown).
+            "on_failure": [
+                {
+                    "kind": "entry",
+                    "op": "set_metadata",
+                    "metadata": {SUBSCRIBE_ERROR_KEY: {"code": "${error.code}", "message": "${error.message}", "at": "${error.at}"}},
+                },
+                {"kind": "entry", "op": "request_review", "reason": "${error.message}"},
             ],
         }
     },

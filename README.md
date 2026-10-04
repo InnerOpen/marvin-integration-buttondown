@@ -5,8 +5,10 @@ Buttondown integration for [Marvin](https://github.com/InnerOpen/marvin): run a 
 
 A signup on your site becomes a Buttondown subscriber. When the reader confirms, their signup entry is
 published; when they unsubscribe, it's archived (inbox = pending, published = confirmed, archived =
-unsubscribed). Publishing a newsletter issue creates its Buttondown email, as a **draft** by default,
-so you review and send it in Buttondown. You can also have it sent straight away, or turn this off.
+unsubscribed). A signup Buttondown refuses goes to **Needs review** with the reason, so it never waits in
+the inbox looking like a pending one. Publishing a newsletter issue creates its Buttondown email, as a
+**draft** by default, so you review and send it in Buttondown. You can also have it sent straight away,
+or turn this off.
 
 ## Connection
 
@@ -23,12 +25,20 @@ if the key is rejected or the config is invalid.
 
 | Action | What it does |
 |---|---|
-| `subscribe` | `email`, optional `tags`, `ip_address` (helps Buttondown's spam firewall), `metadata`, `notes`, `referrer_url`. Returns `subscriber_id` (the API's `sub_…`), `email`, `type`, `already_subscribed`. An address that's already subscribed returns the existing subscriber. If that subscriber never confirmed (`type: unactivated`), Buttondown would send nothing, so `subscribe` asks it to re-send the confirmation email (`POST /v1/subscribers/{id}/send-reminder`) and adds `confirmation_resent: true`. If Buttondown refuses (rate limit, error), the signup still succeeds with `confirmation_resent: false` and a `confirmation_reason`. A confirmed (`regular`) subscriber gets nothing extra. You get a readable error when Buttondown's firewall refuses the address (`subscriber_blocked`, `email_blocked`, `ip_address_spammy`) or when it unsubscribed before (`subscriber_suppressed`). |
+| `subscribe` | `email`, optional `tags`, `ip_address` (helps Buttondown's spam firewall), `metadata`, `notes`, `referrer_url`. Returns `subscriber_id` (the API's `sub_…`), `email`, `type`, `already_subscribed`. An address that's already subscribed returns the existing subscriber. If that subscriber never confirmed (`type: unactivated`), Buttondown would send nothing, so `subscribe` asks it to re-send the confirmation email (`POST /v1/subscribers/{id}/send-reminder`) and adds `confirmation_resent: true`. If Buttondown refuses (rate limit, error), the signup still succeeds with `confirmation_resent: false` and a `confirmation_reason`. A confirmed (`regular`) subscriber gets nothing extra. You get a readable error when Buttondown's firewall refuses the address (`subscriber_blocked`, `email_blocked`, `ip_address_spammy`) or when it unsubscribed before (`subscriber_suppressed`, with the hint to re-add them in Buttondown). |
 | `lookup_subscriber` | `subscriber`: a webhook's UUID, a `sub_` id or an email. Returns `subscriber_id`, `email`, `type`. Buttondown gives a subscriber two ids: the API returns `sub_…` and webhooks carry a UUID. This turns either one into the `sub_` id. |
 | `create_issue_email` | `subject`, `body` (Markdown), `description` (preview text), `canonical_url`, `entry_id`, `email_id`, `site_url`. Follows **Issue delivery**. `canonical_url` (the workflow passes `${entry.url}`, the issue's page on your site) is sent to Buttondown when it is, or can be made, absolute; otherwise it is left out. Runs once per entry: if `email_id` (the entry's stored `buttondown_email_id`) still exists in Buttondown, or an email carries `metadata.marvin_entry_id` for this entry, that email is returned with `skipped: true` and no second email is made. The body is sent with Buttondown's Markdown editor-mode marker. Every create names its status, because Buttondown's own default is `about_to_send` (send). |
 | `connect_webhooks` | **Connect Buttondown webhooks.** Creates or updates the Buttondown webhook that posts this workspace's `subscriber.confirmed` and `subscriber.unsubscribed` events to Marvin: enabled, signed with `signing_key`. Args: `webhook_url` (this workspace's `buttondown` incoming webhook URL), `signing_key: {{BUTTONDOWN_SIGNING_KEY}}`, optional `remove_legacy_url` (an old Marvin hook URL to retire), optional `label` (e.g. the workspace name, shown in Buttondown's description). Safe to run again. The webhook already pointing at `webhook_url` is updated, not duplicated, and extra copies on that URL are removed. Webhooks pointing anywhere else are never touched. `remove_legacy_url` deletes only a webhook whose URL matches it exactly (a trailing slash aside), and it must be a Marvin hook URL. Returns `webhook_id`, `result` (`created` / `updated` / `replaced` / `unchanged`), `removed`, `legacy_removed`. |
 
 Every failure, network errors included, raises a readable error, so the workflow step fails visibly.
+Each error also carries a stable `code` that a workflow's on-failure steps read as `${error.code}`:
+
+| `code` | When |
+|---|---|
+| `blocked` | The spam firewall refused the address (`subscriber_blocked`, `email_blocked`). |
+| `spammy` | The spam firewall refused the visitor's IP (`ip_address_spammy`). |
+| `suppressed` | The address unsubscribed before (`subscriber_suppressed`); only Buttondown can re-add it. |
+| `unknown` | Anything else: another HTTP error, the network, a bad argument or a missing API key. |
 
 It also contributes the **`buttondown`** webhook signature scheme: HMAC-SHA256 of the raw body, hex, in
 `X-Buttondown-Signature: sha256=<hex>` (as Buttondown's docs describe). Buttondown's **Test webhook**
@@ -42,7 +52,7 @@ switched off, and each can stay off on its own.
 | Kind | Slug | What it does |
 |---|---|---|
 | incoming webhook | `buttondown` | Where Buttondown posts subscriber events (scheme `buttondown`, secret `BUTTONDOWN_SIGNING_KEY`). |
-| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. |
+| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails** (on-failure steps): `set_metadata buttondown_subscribe_error` (`{code, message, at}`) → `request_review` with the error as the reason, so the entry moves to **Needs review**. |
 | workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
@@ -82,9 +92,11 @@ If a hook token is rotated, run **Connect Buttondown webhooks** again with the n
 ## Known limits
 
 - A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id, the step fails rather than guess.
-- **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed` and the signup workflow's subscribe step fails with that reason (the signup entry stays in the inbox). To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
+- **A refused signup goes to Needs review; nothing retries it.** When Buttondown refuses an address, or the call fails, the signup workflow's run fails (it shows under **Runs** and as a failed-workflow toast), and its on-failure steps record `buttondown_subscribe_error` on the entry and move it to **Needs review** with the reason. The Review Queue's card shows the reason. Look at the entry: a firewall refusal (`blocked` / `spammy`) is usually spam you can archive; a real reader can be added by hand in Buttondown. An `unknown` failure (Buttondown down, a bad key) is worth fixing and re-adding the same way.
+- **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed`, the run fails and the entry goes to Needs review with code `suppressed`. To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
 - Updating a Buttondown webhook in place needs a Marvin whose integration HTTP helper has PATCH. On an older Marvin, `connect_webhooks` replaces the webhook instead: it creates the new one, then deletes the old one (`result: replaced`). The outcome is the same, but the webhook gets a new id.
-- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step.
+- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The signup workflow's on-failure steps (and `request_review`) need the release after 1.0.0-rc.191; an older Marvin ignores them, so a refused signup stays in the inbox.
+- **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow before keeps the old one. The integration's card marks it with **↑** and an **Update** button; click it to get the on-failure steps (whether it's switched on is kept). Do this once Marvin has the release above.
 
 ## Develop
 

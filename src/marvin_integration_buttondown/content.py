@@ -20,7 +20,7 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
 
 Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
 step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
-signup entry fails the step). The on-failure steps need the release after rc.191; an older Marvin
+signup entry fails the step). The on-failure steps need the release after rc.192; an older Marvin
 ignores them (the run fails and the entry stays in the inbox, as before).
 
 Parameters: `integration` (this integration's slug in the workspace, default `buttondown`),

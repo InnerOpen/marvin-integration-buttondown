@@ -14,6 +14,10 @@ Buttondown quirks this hides:
   Every create here names its status explicitly.
 - Signups can be refused by Buttondown's spam firewall (``400 subscriber_blocked``) or because the
   address unsubscribed before (``subscriber_suppressed``); both come back as readable errors.
+- Re-subscribing an address that never confirmed (``unactivated``) is refused as "already exists" and
+  sends nothing, so ``subscribe`` asks for a confirmation reminder (``POST /subscribers/{id}/send-reminder``).
+- Webhooks are account-wide, and several Marvin workspaces can share one Buttondown account. Each
+  workspace owns only the webhook pointing at its own hook URL; ``connect_webhooks`` never touches others.
 """
 
 from __future__ import annotations
@@ -47,13 +51,24 @@ EDITOR_MODE_MARKER = "<!-- buttondown-editor-mode: plaintext -->"
 ENTRY_METADATA_KEY = "marvin_entry_id"
 
 ALREADY_SUBSCRIBED = {"email_already_exists", "subscriber_already_exists"}
+UNACTIVATED = "unactivated"
 FIREWALLED = {"subscriber_blocked", "email_blocked", "ip_address_spammy"}
 
 _STR = {"type": "string"}
+_BOOL = {"type": "boolean"}
 _SUBSCRIBER_OUT = {
     "type": "object",
-    "properties": {"subscriber_id": _STR, "email": _STR, "type": _STR, "already_subscribed": {"type": "boolean"}},
+    "properties": {"subscriber_id": _STR, "email": _STR, "type": _STR, "already_subscribed": _BOOL},
 }
+
+# What the declared workflows react to — nothing else is worth a delivery.
+WEBHOOK_EVENTS = ("subscriber.confirmed", "subscriber.unsubscribed")
+WEBHOOK_DESCRIPTION = "Marvin: subscriber confirmations and unsubscribes"
+WEBHOOK_ENABLED = "enabled"
+# Marvin's incoming webhook URLs are https://<api>/api/hooks/<token>.
+HOOK_PATH = "/api/hooks/"
+# A cap on following `next` pages, so a misbehaving API can't loop the action forever.
+MAX_WEBHOOK_PAGES = 20
 
 
 def _error(resp: Response) -> tuple[str, str]:
@@ -73,6 +88,11 @@ def _error(resp: Response) -> tuple[str, str]:
 def _fail(resp: Response, what: str) -> ValueError:
     code, detail = _error(resp)
     return ValueError(f"Buttondown {what} failed: HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}")
+
+
+def _same_url(a: str, b: str) -> bool:
+    """The same hook URL, give or take surrounding blanks and a trailing slash — never a looser match."""
+    return bool(a) and a.strip().rstrip("/") == b.strip().rstrip("/")
 
 
 def _text(value) -> str:
@@ -139,7 +159,10 @@ class ButtondownProvider(IntegrationProvider):
         ProviderAction(
             key="subscribe",
             label="Subscribe",
-            description="Add an email address to the newsletter. An address that is already subscribed returns its existing subscriber.",
+            description=(
+                "Add an email address to the newsletter. An address that is already subscribed returns its existing subscriber; "
+                "one that never confirmed (unactivated) is sent a fresh confirmation email."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -153,7 +176,10 @@ class ButtondownProvider(IntegrationProvider):
                 "required": ["email"],
                 "additionalProperties": False,
             },
-            output_schema=_SUBSCRIBER_OUT,
+            output_schema={
+                "type": "object",
+                "properties": {**_SUBSCRIBER_OUT["properties"], "confirmation_resent": _BOOL, "confirmation_reason": _STR},
+            },
         ),
         ProviderAction(
             key="lookup_subscriber",
@@ -201,6 +227,53 @@ class ButtondownProvider(IntegrationProvider):
             output_schema={
                 "type": "object",
                 "properties": {"email_id": _STR, "status": _STR, "delivery": _STR, "skipped": {"type": "boolean"}, "reason": _STR, "url": _STR},
+            },
+        ),
+        ProviderAction(
+            key="connect_webhooks",
+            label="Connect Buttondown webhooks",
+            description=(
+                "Create (or update) the one Buttondown webhook that posts this workspace's subscriber confirmations and unsubscribes "
+                "to Marvin, signed with the given key. Webhooks pointing anywhere else are left alone; optionally deletes the webhook "
+                "for an old Marvin hook URL you are retiring."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "webhook_url": {
+                        "type": "string",
+                        "title": "Webhook URL",
+                        "description": "This workspace's buttondown incoming webhook URL (https://…/api/hooks/<token>).",
+                    },
+                    "signing_key": {
+                        "type": "string",
+                        "title": "Signing key",
+                        "description": "The key Buttondown signs with — pass {{BUTTONDOWN_SIGNING_KEY}} (the webhook's signing secret).",
+                    },
+                    "remove_legacy_url": {
+                        "type": "string",
+                        "title": "Old hook URL to retire",
+                        "description": "Optional: an old Marvin hook URL. A Buttondown webhook pointing at exactly this URL is deleted.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "title": "Label",
+                        "description": "Optional: shown in Buttondown's webhook description, e.g. the workspace name.",
+                    },
+                },
+                "required": ["webhook_url", "signing_key"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "webhook_id": _STR,
+                    "result": {"type": "string", "enum": ["created", "updated", "replaced", "unchanged"]},
+                    "created": _BOOL,
+                    "event_types": {"type": "array", "items": _STR},
+                    "removed": {"type": "array", "items": _STR},
+                    "legacy_removed": _BOOL,
+                },
             },
         ),
     )
@@ -260,6 +333,7 @@ class ButtondownProvider(IntegrationProvider):
             "subscribe": self._subscribe,
             "lookup_subscriber": self._lookup_subscriber,
             "create_issue_email": self._create_issue_email,
+            "connect_webhooks": self._connect_webhooks,
         }.get(key)
         if handler is None:
             raise NotImplementedError(f"buttondown has no action '{key}'")
@@ -295,12 +369,29 @@ class ButtondownProvider(IntegrationProvider):
         if code in ALREADY_SUBSCRIBED:
             existing = self._fetch_subscriber(ctx, email)
             if existing:
-                return self._subscriber(existing, already=True)
+                out = self._subscriber(existing, already=True)
+                if out["type"] == UNACTIVATED:
+                    out.update(self._resend_confirmation(ctx, out["subscriber_id"] or email))
+                return out
         if code in FIREWALLED:
             raise ValueError(f"Buttondown's spam firewall refused {email} ({code}): {detail}")
         if code == "subscriber_suppressed":
             raise ValueError(f"{email} unsubscribed from this newsletter before, so Buttondown won't re-add it from a signup ({code}): {detail}")
         raise _fail(resp, "subscribe")
+
+    def _resend_confirmation(self, ctx: IntegrationContext, key: str) -> dict:
+        """Ask Buttondown to re-send the confirmation email. Never fails the signup: a refusal (rate limit, error) is reported."""
+        try:
+            resp = ctx.http.post(f"{API}/subscribers/{quote(key, safe='@')}/send-reminder", json={}, headers=self._headers(ctx))
+        except Exception as e:  # noqa: BLE001 — the signup itself succeeded; a missed reminder is not worth failing it
+            reason = f"{type(e).__name__}: {e}"
+        else:
+            if resp.ok:
+                return {"confirmation_resent": True}
+            code, detail = _error(resp)
+            reason = f"HTTP {resp.status_code}{f' {code}' if code else ''}: {detail}"
+        ctx.logger.warning("buttondown: could not re-send the confirmation email to %s — %s", key, reason)
+        return {"confirmation_resent": False, "confirmation_reason": reason}
 
     def _lookup_subscriber(self, args: dict, ctx: IntegrationContext) -> dict:
         key = _text(args.get("subscriber"))
@@ -399,4 +490,94 @@ class ButtondownProvider(IntegrationProvider):
             "skipped": False,
             "reason": "",
             "url": created.get("absolute_url") or "",
+        }
+
+    # ---- webhooks ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _hook_url(value, arg: str) -> str:
+        url = _text(value)
+        if not url.startswith("https://") or HOOK_PATH not in url or not url.split(HOOK_PATH, 1)[1].strip("/"):
+            raise ValueError(f"{arg} must be a Marvin incoming webhook URL (https://…{HOOK_PATH}<token>), got {url!r}.")
+        return url
+
+    def _list_webhooks(self, ctx: IntegrationContext) -> list[dict]:
+        webhooks: list[dict] = []
+        url = f"{API}/webhooks"
+        for _ in range(MAX_WEBHOOK_PAGES):
+            resp = ctx.http.get(url, headers=self._headers(ctx))
+            if not resp.ok:
+                raise _fail(resp, "list webhooks")
+            page = resp.json() or {}
+            webhooks.extend(page.get("results") or [])
+            url = str(page.get("next") or "")
+            if not url.startswith(API):  # no next page (or one somewhere we never send the key)
+                break
+        return webhooks
+
+    def _send_webhook(self, ctx: IntegrationContext, method: str, path: str, body: dict, what: str) -> dict:
+        resp = getattr(ctx.http, method)(f"{API}{path}", json=body, headers=self._headers(ctx))
+        if not resp.ok:
+            raise _fail(resp, what)
+        return resp.json() or {}
+
+    def _delete_webhook(self, ctx: IntegrationContext, webhook_id: str) -> str:
+        resp = ctx.http.delete(f"{API}/webhooks/{quote(webhook_id, safe='')}", headers=self._headers(ctx))
+        if not resp.ok and resp.status_code != 404:  # already gone is as good as deleted
+            raise _fail(resp, "delete webhook")
+        return webhook_id
+
+    @staticmethod
+    def _webhook_matches(existing: dict, desired: dict) -> bool:
+        return (
+            existing.get("status") == desired["status"]
+            and sorted(existing.get("event_types") or []) == sorted(desired["event_types"])
+            and (existing.get("description") or "") == desired["description"]
+            and (existing.get("signing_key") or "") == desired["signing_key"]  # a masked key never matches, so it is re-set
+        )
+
+    def _upsert_webhook(self, ctx: IntegrationContext, existing: dict | None, desired: dict) -> dict:
+        if existing is None:
+            created = self._send_webhook(ctx, "post", "/webhooks", desired, "create webhook")
+            return {"webhook_id": created.get("id") or "", "result": "created"}
+        webhook_id = str(existing.get("id") or "")
+        if self._webhook_matches(existing, desired):
+            return {"webhook_id": webhook_id, "result": "unchanged"}
+        if callable(getattr(ctx.http, "patch", None)):
+            self._send_webhook(ctx, "patch", f"/webhooks/{quote(webhook_id, safe='')}", desired, "update webhook")
+            return {"webhook_id": webhook_id, "result": "updated"}
+        # Buttondown updates only by PATCH, which this Marvin's http helper lacks: replace it, new one first so no event is missed.
+        created = self._send_webhook(ctx, "post", "/webhooks", desired, "create webhook")
+        self._delete_webhook(ctx, webhook_id)
+        return {"webhook_id": created.get("id") or "", "result": "replaced"}
+
+    def _connect_webhooks(self, args: dict, ctx: IntegrationContext) -> dict:
+        url = self._hook_url(args.get("webhook_url"), "webhook_url")
+        signing_key = _text(args.get("signing_key"))
+        if not signing_key or signing_key.startswith("{{"):
+            raise ValueError("signing_key is required — pass {{BUTTONDOWN_SIGNING_KEY}} (the buttondown webhook's signing secret).")
+        legacy = self._hook_url(args.get("remove_legacy_url"), "remove_legacy_url") if _text(args.get("remove_legacy_url")) else ""
+        if legacy and _same_url(legacy, url):
+            raise ValueError("remove_legacy_url is the webhook URL being connected — pass the old hook's URL, or leave it blank.")
+        label = _text(args.get("label"))
+        desired = {
+            "url": url,
+            "event_types": list(WEBHOOK_EVENTS),
+            "status": WEBHOOK_ENABLED,
+            "description": f"{WEBHOOK_DESCRIPTION} ({label})" if label else WEBHOOK_DESCRIPTION,
+            "signing_key": signing_key,
+        }
+
+        webhooks = [w for w in self._list_webhooks(ctx) if w.get("id")]
+        ours = [w for w in webhooks if _same_url(str(w.get("url") or ""), url)]
+        result = self._upsert_webhook(ctx, ours[0] if ours else None, desired)
+        # Extra webhooks on our own URL would deliver every event twice.
+        removed = [self._delete_webhook(ctx, str(w.get("id") or "")) for w in ours[1:]]
+        retired = [self._delete_webhook(ctx, str(w.get("id") or "")) for w in webhooks if legacy and _same_url(str(w.get("url") or ""), legacy)]
+        return {
+            **result,
+            "created": result["result"] == "created",
+            "event_types": list(WEBHOOK_EVENTS),
+            "removed": removed + retired,
+            "legacy_removed": bool(retired),
         }

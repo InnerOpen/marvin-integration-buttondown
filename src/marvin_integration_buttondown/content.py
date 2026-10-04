@@ -70,8 +70,8 @@ EVENTS_WEBHOOK = ContentBlueprint(
     slug=WEBHOOK_SLUG,
     name="Buttondown events",
     description=(
-        "Where Buttondown posts subscriber events. Mint its token, paste the URL into Buttondown → Settings → Webhooks "
-        f"(subscriber.confirmed and subscriber.unsubscribed), and store that webhook's signing key here as {SECRET_REF}."
+        f"Where Buttondown posts subscriber events. Mint its token, generate a key under Signing (stored as {SECRET_REF}), "
+        "then run the connection's Connect Buttondown webhooks action with this webhook's URL — it creates the Buttondown side."
     ),
     required=True,
     category=CATEGORY,

@@ -41,6 +41,9 @@ class _Http:
     def put(self, url, *, json=None, data=None, headers=None, timeout=15):
         return self._answer("PUT", url, json, data, headers)
 
+    def patch(self, url, *, json=None, data=None, headers=None, timeout=15):
+        return self._answer("PATCH", url, json, data, headers)
+
     def delete(self, url, *, headers=None, timeout=15):
         return self._answer("DELETE", url, headers=headers)
 
@@ -116,6 +119,42 @@ def test_subscribe_an_existing_address_returns_the_existing_subscriber():
     )
     out = _run(http, "subscribe", email="reader@example.com")
     assert out == {"subscriber_id": SUB_ID, "email": "reader@example.com", "type": "regular", "already_subscribed": True}
+    assert not any("send-reminder" in c["url"] for c in http.calls)  # a confirmed reader gets no reminder
+
+
+_ALREADY = ("POST", "/v1/subscribers", 400, {"code": "email_already_exists", "detail": "That email address is already subscribed."})
+_UNACTIVATED = ("GET", "/v1/subscribers/reader@example.com", 200, SUBSCRIBER)
+_REMINDER = f"/subscribers/{SUB_ID}/send-reminder"
+SUBSCRIBED_OUT = {"subscriber_id": SUB_ID, "email": "reader@example.com", "type": "unactivated"}
+
+
+def test_subscribe_an_unconfirmed_address_resends_the_confirmation():
+    # The reminder route goes first: the stub matches by substring and /v1/subscribers would catch it.
+    http = _Http([("POST", _REMINDER, 200, {}), _ALREADY, _UNACTIVATED])
+    out = _run(http, "subscribe", email="reader@example.com")
+
+    assert out == {**SUBSCRIBED_OUT, "already_subscribed": True, "confirmation_resent": True}
+    assert http.posted(_REMINDER)["headers"]["Authorization"] == f"Token {KEY}"
+
+
+def test_subscribe_a_refused_reminder_does_not_fail_the_signup():
+    http = _Http([("POST", _REMINDER, 429, {"code": "rate_limited", "detail": "Slow down."}), _ALREADY, _UNACTIVATED])
+    out = _run(http, "subscribe", email="reader@example.com")
+
+    assert out["already_subscribed"] is True and out["confirmation_resent"] is False
+    assert out["confirmation_reason"] == "HTTP 429 rate_limited: Slow down."
+
+
+class _ReminderOffline(_Http):
+    def post(self, url, *, json=None, data=None, headers=None, timeout=15):
+        if "send-reminder" in url:
+            raise OSError("Network is unreachable")
+        return super().post(url, json=json, data=data, headers=headers, timeout=timeout)
+
+
+def test_subscribe_a_reminder_network_error_does_not_fail_the_signup():
+    out = _run(_ReminderOffline([_ALREADY, _UNACTIVATED]), "subscribe", email="reader@example.com")
+    assert out["confirmation_resent"] is False and "Network is unreachable" in out["confirmation_reason"]
 
 
 def test_subscribe_blocked_by_the_spam_firewall_is_a_readable_error():
@@ -332,7 +371,166 @@ def test_a_network_error_fails_the_step_as_a_value_error():
 
 
 def test_declared_actions_match_the_handlers():
-    assert {a.key for a in ButtondownProvider.actions} == {"subscribe", "lookup_subscriber", "create_issue_email"}
+    assert {a.key for a in ButtondownProvider.actions} == {"subscribe", "lookup_subscriber", "create_issue_email", "connect_webhooks"}
+
+
+# --- connect_webhooks -------------------------------------------------------------------------------
+
+HOOK = "https://api.example.com/api/hooks/tok_new"
+LEGACY = "https://api.example.com/api/hooks/tok_old"
+SIGNING = "whsec-123"
+EVENTS = ["subscriber.confirmed", "subscriber.unsubscribed"]
+DESCRIPTION = "Marvin: subscriber confirmations and unsubscribes"
+# Another workspace on the same Buttondown account and the same Marvin host — never ours to touch.
+FOREIGN = {"id": "wh_other", "url": "https://api.example.com/api/hooks/tok_other", "status": "enabled", "event_types": EVENTS}
+DESIRED = {"url": HOOK, "event_types": EVENTS, "status": "enabled", "description": DESCRIPTION, "signing_key": SIGNING}
+
+
+def _webhooks(*results, next_url=None):
+    return ("GET", "/v1/webhooks", 200, {"results": list(results), "next": next_url, "count": len(results)})
+
+
+def _connect(http, **args):
+    return _run(http, "connect_webhooks", webhook_url=HOOK, signing_key=SIGNING, **args)
+
+
+def _writes(http):
+    return [(c["method"], c["url"].removeprefix(API)) for c in http.calls if c["method"] != "GET"]
+
+
+def test_connect_webhooks_creates_one_enabled_signed_webhook_for_our_url():
+    http = _Http([_webhooks(FOREIGN), ("POST", "/v1/webhooks", 201, {"id": "wh_new", **DESIRED})])
+    out = _connect(http)
+
+    assert out == {"webhook_id": "wh_new", "result": "created", "created": True, "event_types": EVENTS, "removed": [], "legacy_removed": False}
+    assert http.posted("/webhooks")["json"] == DESIRED
+    assert _writes(http) == [("POST", "/webhooks")]  # the other workspace's webhook is untouched
+
+
+def test_connect_webhooks_updates_the_webhook_already_on_our_url_in_place():
+    stale = {"id": "wh_ours", "url": HOOK + "/", "status": "disabled", "event_types": ["subscriber.created"], "description": "", "signing_key": ""}
+    http = _Http([_webhooks(FOREIGN, stale), ("PATCH", "/v1/webhooks/wh_ours", 200, {**stale, **DESIRED})])
+    out = _connect(http)
+
+    assert out["result"] == "updated" and out["webhook_id"] == "wh_ours" and out["created"] is False
+    assert _writes(http) == [("PATCH", "/webhooks/wh_ours")]
+    assert http.calls[-1]["json"] == DESIRED
+
+
+def test_connect_webhooks_leaves_a_matching_webhook_alone():
+    http = _Http([_webhooks(FOREIGN, {"id": "wh_ours", **DESIRED})])
+    assert _connect(http)["result"] == "unchanged"
+    assert _writes(http) == []
+
+
+def test_connect_webhooks_labels_the_description():
+    http = _Http([_webhooks(), ("POST", "/v1/webhooks", 201, {"id": "wh_new"})])
+    _connect(http, label="Mash & Burn")
+    assert http.posted("/webhooks")["json"]["description"] == f"{DESCRIPTION} (Mash & Burn)"
+
+
+class _NoPatchHttp(_Http):
+    patch = None  # a Marvin whose http helper predates PATCH
+
+
+def test_connect_webhooks_without_patch_replaces_the_webhook_new_one_first():
+    stale = {"id": "wh_ours", "url": HOOK, "status": "disabled", "event_types": EVENTS}
+    http = _NoPatchHttp([_webhooks(stale), ("POST", "/v1/webhooks", 201, {"id": "wh_new", **DESIRED}), ("DELETE", "/v1/webhooks/wh_ours", 204, {})])
+    out = _connect(http)
+
+    assert out["result"] == "replaced" and out["webhook_id"] == "wh_new"
+    assert _writes(http) == [("POST", "/webhooks"), ("DELETE", "/webhooks/wh_ours")]
+
+
+def test_connect_webhooks_removes_duplicates_on_our_own_url():
+    http = _Http([_webhooks({"id": "wh_a", **DESIRED}, {"id": "wh_b", **DESIRED}), ("DELETE", "/v1/webhooks/wh_b", 204, {})])
+    out = _connect(http)
+    assert out["result"] == "unchanged" and out["removed"] == ["wh_b"]
+    assert _writes(http) == [("DELETE", "/webhooks/wh_b")]
+
+
+def test_connect_webhooks_retires_the_legacy_url_on_an_exact_match_only():
+    legacy = {"id": "wh_legacy", "url": LEGACY, "status": "enabled", "event_types": EVENTS}
+    near_miss = {"id": "wh_near", "url": LEGACY + "2", "status": "enabled", "event_types": EVENTS}
+    http = _Http(
+        [
+            _webhooks(FOREIGN, legacy, near_miss, {"id": "wh_ours", **DESIRED}),
+            ("DELETE", "/v1/webhooks/wh_legacy", 204, {}),
+        ]
+    )
+    out = _connect(http, remove_legacy_url=LEGACY)
+
+    assert out["legacy_removed"] is True and out["removed"] == ["wh_legacy"]
+    assert _writes(http) == [("DELETE", "/webhooks/wh_legacy")]
+
+
+def test_connect_webhooks_a_legacy_url_buttondown_does_not_have_is_not_an_error():
+    http = _Http([_webhooks(FOREIGN, {"id": "wh_ours", **DESIRED})])
+    out = _connect(http, remove_legacy_url=LEGACY)
+    assert out["legacy_removed"] is False and _writes(http) == []
+
+
+def test_connect_webhooks_follows_pagination():
+    page2 = f"{API}/webhooks?page=2"
+    http = _Http(
+        [
+            ("GET", "/v1/webhooks?page=2", 200, {"results": [{"id": "wh_ours", **DESIRED}], "next": None}),
+            _webhooks(FOREIGN, next_url=page2),
+        ]
+    )
+    assert _connect(http)["result"] == "unchanged"
+    assert [c["url"] for c in http.calls] == [f"{API}/webhooks", page2]
+
+
+class _FakeButtondown(_Http):
+    """Just enough of Buttondown's webhook store to run the action twice against the same state."""
+
+    def __init__(self, webhooks):
+        super().__init__([])
+        self.store = {w["id"]: dict(w) for w in webhooks}
+
+    def get(self, url, *, headers=None, timeout=15):
+        self.calls.append({"method": "GET", "url": url})
+        return Response(status_code=200, content=json.dumps({"results": list(self.store.values()), "next": None}).encode())
+
+    def post(self, url, **kwargs):  # kwargs, not json=: the parameter would shadow the json module
+        self.calls.append({"method": "POST", "url": url})
+        created = {"id": f"wh_{len(self.store) + 1}", **kwargs["json"]}
+        self.store[created["id"]] = created
+        return Response(status_code=201, content=json.dumps(created).encode())
+
+
+def test_connect_webhooks_twice_makes_exactly_one_webhook():
+    fake = _FakeButtondown([FOREIGN])
+    first, second = _connect(fake), _connect(fake)
+
+    assert (first["result"], second["result"]) == ("created", "unchanged")
+    assert sorted(w["url"] for w in fake.store.values()) == sorted([FOREIGN["url"], HOOK])
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        ({"webhook_url": "https://api.example.com/settings/webhooks", "signing_key": SIGNING}, "Marvin incoming webhook URL"),
+        ({"webhook_url": "http://api.example.com/api/hooks/tok", "signing_key": SIGNING}, "Marvin incoming webhook URL"),
+        ({"webhook_url": "https://api.example.com/api/hooks/", "signing_key": SIGNING}, "Marvin incoming webhook URL"),
+        ({"webhook_url": HOOK, "signing_key": "{{BUTTONDOWN_SIGNING_KEY}}"}, "signing_key is required"),
+        ({"webhook_url": HOOK, "signing_key": ""}, "signing_key is required"),
+        ({"webhook_url": HOOK, "signing_key": SIGNING, "remove_legacy_url": HOOK + "/"}, "being connected"),
+        ({"webhook_url": HOOK, "signing_key": SIGNING, "remove_legacy_url": "https://example.com/other"}, "remove_legacy_url must be"),
+    ],
+)
+def test_connect_webhooks_rejects_bad_arguments_before_calling_buttondown(args, message):
+    http = _Http([])
+    with pytest.raises(ValueError, match=message):
+        _run(http, "connect_webhooks", **args)
+    assert http.calls == []
+
+
+def test_connect_webhooks_list_failure_is_readable():
+    http = _Http([("GET", "/v1/webhooks", 403, {"code": "forbidden", "detail": "Your plan lacks webhooks."})])
+    with pytest.raises(ValueError, match="list webhooks failed: HTTP 403 forbidden: Your plan lacks webhooks."):
+        _connect(http)
 
 
 # --- signature scheme -------------------------------------------------------------------------------

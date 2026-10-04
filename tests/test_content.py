@@ -11,6 +11,7 @@ from marvin_integration_buttondown.content import (
     UNSUBSCRIBED,
     UNSUBSCRIBED_COLLECTION,
 )
+from marvin_integration_buttondown.provider import WEBHOOK_EVENTS
 
 ACTION_KEYS = {a.key for a in ButtondownProvider.actions}
 
@@ -44,6 +45,17 @@ def test_the_webhook_requires_the_buttondown_signature():
     assert EVENTS_WEBHOOK.payload["signature_scheme"] in ButtondownProvider.signature_schemes
     assert EVENTS_WEBHOOK.payload["signing_secret_ref"] == "BUTTONDOWN_SIGNING_KEY"
     assert "token" not in EVENTS_WEBHOOK.payload  # minted in the workspace, never declared
+
+
+def test_connect_webhooks_subscribes_to_exactly_the_events_the_workflows_handle():
+    handled = {
+        cond["value"]
+        for b in CONTENT
+        if b.kind == "workflow" and _definition(b)["trigger"]["type"] == "incoming_webhook"
+        for cond in _definition(b)["conditions"]
+        if cond["field"] == "event.payload.event_type"
+    }
+    assert handled == set(WEBHOOK_EVENTS)
 
 
 def test_every_integration_step_calls_a_declared_action_of_the_parameterised_connection():

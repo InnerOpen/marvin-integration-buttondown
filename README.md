@@ -23,9 +23,10 @@ if the key is rejected or the config is invalid.
 
 | Action | What it does |
 |---|---|
-| `subscribe` | `email`, optional `tags`, `ip_address` (helps Buttondown's spam firewall), `metadata`, `notes`, `referrer_url`. Returns `subscriber_id` (the API's `sub_…`), `email`, `type`, `already_subscribed`. An address that's already subscribed returns the existing subscriber. You get a readable error when Buttondown's firewall refuses the address (`subscriber_blocked`, `email_blocked`, `ip_address_spammy`) or when it unsubscribed before (`subscriber_suppressed`). |
+| `subscribe` | `email`, optional `tags`, `ip_address` (helps Buttondown's spam firewall), `metadata`, `notes`, `referrer_url`. Returns `subscriber_id` (the API's `sub_…`), `email`, `type`, `already_subscribed`. An address that's already subscribed returns the existing subscriber. If that subscriber never confirmed (`type: unactivated`), Buttondown would send nothing, so `subscribe` asks it to re-send the confirmation email (`POST /v1/subscribers/{id}/send-reminder`) and adds `confirmation_resent: true`. If Buttondown refuses (rate limit, error), the signup still succeeds with `confirmation_resent: false` and a `confirmation_reason`. A confirmed (`regular`) subscriber gets nothing extra. You get a readable error when Buttondown's firewall refuses the address (`subscriber_blocked`, `email_blocked`, `ip_address_spammy`) or when it unsubscribed before (`subscriber_suppressed`). |
 | `lookup_subscriber` | `subscriber`: a webhook's UUID, a `sub_` id or an email. Returns `subscriber_id`, `email`, `type`. Buttondown gives a subscriber two ids: the API returns `sub_…` and webhooks carry a UUID. This turns either one into the `sub_` id. |
 | `create_issue_email` | `subject`, `body` (Markdown), `description` (preview text), `canonical_url`, `entry_id`, `email_id`, `site_url`. Follows **Issue delivery**. `canonical_url` (the workflow passes `${entry.url}`, the issue's page on your site) is sent to Buttondown when it is, or can be made, absolute; otherwise it is left out. Runs once per entry: if `email_id` (the entry's stored `buttondown_email_id`) still exists in Buttondown, or an email carries `metadata.marvin_entry_id` for this entry, that email is returned with `skipped: true` and no second email is made. The body is sent with Buttondown's Markdown editor-mode marker. Every create names its status, because Buttondown's own default is `about_to_send` (send). |
+| `connect_webhooks` | **Connect Buttondown webhooks.** Creates or updates the Buttondown webhook that posts this workspace's `subscriber.confirmed` and `subscriber.unsubscribed` events to Marvin: enabled, signed with `signing_key`. Args: `webhook_url` (this workspace's `buttondown` incoming webhook URL), `signing_key: {{BUTTONDOWN_SIGNING_KEY}}`, optional `remove_legacy_url` (an old Marvin hook URL to retire), optional `label` (e.g. the workspace name, shown in Buttondown's description). Safe to run again. The webhook already pointing at `webhook_url` is updated, not duplicated, and extra copies on that URL are removed. Webhooks pointing anywhere else are never touched. `remove_legacy_url` deletes only a webhook whose URL matches it exactly (a trailing slash aside), and it must be a Marvin hook URL. Returns `webhook_id`, `result` (`created` / `updated` / `replaced` / `unchanged`), `removed`, `legacy_removed`. |
 
 Every failure, network errors included, raises a readable error, so the workflow step fails visibly.
 
@@ -59,14 +60,30 @@ Parameters, asked when you apply:
 
 1. Store the API key as a workspace secret. Connect the integration with `{{BUTTONDOWN_API_KEY}}` and pick the **Issue delivery**. Set a **Site URL** only if the workspace has no Canonical URL.
 2. **Apply** the content.
-3. Open the `buttondown` incoming webhook and click **Mint token**. Copy the URL.
-4. In Buttondown → Settings → Webhooks, add that URL for `subscriber.confirmed` and `subscriber.unsubscribed` and generate a signing key. Store the key in Marvin as the workspace secret `BUTTONDOWN_SIGNING_KEY`.
-5. Switch on the webhook and the workflows you want.
+3. Open the `buttondown` incoming webhook (Automation → Incoming webhooks). Click **Mint token** and copy the URL. Under **Signing**, click **Change**, keep the secret `BUTTONDOWN_SIGNING_KEY` and click **Generate key**. You can skip this if the workspace already has that secret. You don't paste the key anywhere: the next step hands it to Buttondown.
+4. On the integration's card, run **Connect Buttondown webhooks** with:
+   - **webhook_url**: the URL from step 3
+   - **signing_key**: `{{BUTTONDOWN_SIGNING_KEY}}`
+   - **remove_legacy_url** (optional): the URL of an older hand-built Buttondown hook you're retiring, e.g. a `buttondown-incoming-webhook`
+   - **label** (optional): the workspace name
+5. Switch on the `buttondown` incoming webhook and the workflows you want. A provider can't switch Marvin's webhooks on, so this one is a click.
+6. If you had an older hand-built Buttondown hook in Marvin, delete it (Automation → Incoming webhooks).
+
+Repeat steps 3–6 in **every workspace that shares the Buttondown account**.
+
+### Several workspaces, one Buttondown account
+
+Buttondown webhooks belong to the account, so every workspace on the account gets its own webhook, each pointing at its own Marvin hook URL and signed with its own key. `connect_webhooks` only ever changes the webhook on the URL you give it (plus the exact legacy URL, if you name one). Running it in workspace B leaves workspace A's webhook alone.
+
+Each workspace then receives every confirm and unsubscribe on the account, including readers who signed up through another workspace's site. Those readers have no signup entry in this workspace, so the entry step skips them (`if_none: skip`) and the run stays green.
+
+If a hook token is rotated, run **Connect Buttondown webhooks** again with the new URL and the old one as `remove_legacy_url`.
 
 ## Known limits
 
 - A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id, the step fails rather than guess.
 - **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed` and the signup workflow's subscribe step fails with that reason (the signup entry stays in the inbox). To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
+- Updating a Buttondown webhook in place needs a Marvin whose integration HTTP helper has PATCH. On an older Marvin, `connect_webhooks` replaces the webhook instead: it creates the new one, then deletes the old one (`result: replaced`). The outcome is the same, but the webhook gets a new id.
 - Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step.
 
 ## Develop

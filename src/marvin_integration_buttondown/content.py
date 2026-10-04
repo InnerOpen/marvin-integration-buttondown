@@ -1,9 +1,9 @@
 """What a workspace needs to run its newsletter through Buttondown — declared for the core to offer.
 
 Applying (from the integration's card) creates only what is missing: the incoming webhook Buttondown
-posts subscriber events to, four workflows, and two optional ones for a confirmed readers' collection.
-Webhooks and workflows arrive switched off; turning them on after a review is the deliberate last
-step — and each can stay off on its own.
+posts subscriber events to, four workflows, and two optional private smart collections (confirmed
+and unsubscribed readers). Webhooks and workflows arrive switched off; turning them on after a
+review is the deliberate last step — and each can stay off on its own.
 
 The loop (Marvin is the list of record; a signup entry's status mirrors Buttondown):
   a site signup (a `newsletter` form submission, not flagged as spam) → `subscribe` → the subscriber's
@@ -23,10 +23,15 @@ step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, a
 signup entry fails the step). The on-failure steps need the release after rc.192; an older Marvin
 ignores them (the run fails and the entry stays in the inbox, as before).
 
+The collections need no workflow: a signup's status already says where it stands (published =
+confirmed, archived = unsubscribed), so each is a smart collection over the signup type and one
+status, and membership follows the entry. Both are private (not "Visible to sites"), so changes to
+them never rebuild a site and a site can't read the list. Apply never overwrites: a workspace that
+already has a collection with either slug keeps it as it is (switch it to Smart by hand).
+
 Parameters: `integration` (this integration's slug in the workspace, default `buttondown`),
 `signup_type` (the signup form's entry type, default `newsletter`) and `issue_type` (the issue
-entry type, default `newsletter-issue`, whose `body` and `preview` fields make the email), plus
-`collection` for the two optional workflows.
+entry type, default `newsletter-issue`, whose `body` and `preview` fields make the email).
 """
 
 from marvin_integration_sdk import ContentBlueprint
@@ -57,13 +62,6 @@ ISSUE_TYPE_PARAM = {
     "help": "Publishing one of these creates the Buttondown email (its body and preview fields).",
 }
 
-COLLECTION_PARAM = {
-    "key": "collection",
-    "label": "Which collection holds confirmed readers?",
-    "kind": "collection",
-    "default": "confirmed-subscribers",
-    "help": "Create it first; confirmed readers are added, unsubscribed ones removed.",
-}
 
 SUBSCRIBER_ID_KEY = "buttondown_subscriber_id"
 SUBSCRIBE_ERROR_KEY = "buttondown_subscribe_error"
@@ -137,9 +135,7 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
 )
 
 
-def _subscriber_event(
-    slug: str, name: str, description: str, event_type: str, step: dict, *, required: bool = True, extra_params: tuple = ()
-) -> ContentBlueprint:
+def _subscriber_event(slug: str, name: str, description: str, event_type: str, step: dict) -> ContentBlueprint:
     """A Buttondown subscriber event → ``step`` on the signup entry with that subscriber's API id.
 
     Webhooks carry a UUID the API never returns, so the entry can't be matched on it directly:
@@ -150,9 +146,9 @@ def _subscriber_event(
         slug=slug,
         name=name,
         description=description,
-        required=required,
+        required=True,
         category=CATEGORY,
-        parameters=(SIGNUP_TYPE_PARAM, INTEGRATION_PARAM, *extra_params),
+        parameters=(SIGNUP_TYPE_PARAM, INTEGRATION_PARAM),
         payload={
             "definition": {
                 "trigger": {"type": "incoming_webhook", "webhook": WEBHOOK_SLUG},
@@ -200,28 +196,6 @@ UNSUBSCRIBED = _subscriber_event(
     {"op": "archive"},
 )
 
-# Optional: keep a collection of confirmed readers in step with Buttondown. Separate workflows, so the
-# core loop needs no collection and a workspace without one simply doesn't apply these.
-CONFIRMED_COLLECTION = _subscriber_event(
-    "buttondown-confirmed-to-collection",
-    "Buttondown: add confirmed readers to a collection",
-    "When a reader confirms, add their signup entry to a collection (e.g. confirmed-subscribers).",
-    "subscriber.confirmed",
-    {"op": "add_to_collection", "collection_slug": "{{collection}}"},
-    required=False,
-    extra_params=(COLLECTION_PARAM,),
-)
-
-UNSUBSCRIBED_COLLECTION = _subscriber_event(
-    "buttondown-unsubscribed-from-collection",
-    "Buttondown: remove unsubscribed readers from the collection",
-    "When a reader unsubscribes, take their signup entry out of the confirmed readers' collection.",
-    "subscriber.unsubscribed",
-    {"op": "remove_from_collection", "collection_slug": "{{collection}}"},
-    required=False,
-    extra_params=(COLLECTION_PARAM,),
-)
-
 ISSUE_ON_PUBLISH = ContentBlueprint(
     kind="workflow",
     slug="buttondown-issue-on-publish",
@@ -266,4 +240,43 @@ ISSUE_ON_PUBLISH = ContentBlueprint(
     },
 )
 
-CONTENT = (EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, CONFIRMED_COLLECTION, UNSUBSCRIBED_COLLECTION)
+
+def _signups_with_status(slug: str, name: str, description: str, status: str, icon: str) -> ContentBlueprint:
+    """A private smart collection of the signup entries in one status.
+
+    Optional (a suggestion): the loop works without it. Private so membership changes — every
+    confirm and unsubscribe — never request a site rebuild, and the publishing API never lists readers."""
+    return ContentBlueprint(
+        kind="collection",
+        slug=slug,
+        name=name,
+        description=description,
+        category=CATEGORY,
+        parameters=(SIGNUP_TYPE_PARAM,),
+        payload={
+            "description": description,
+            "icon": icon,
+            "is_smart": True,
+            "is_public": False,
+            "smart_rules": {"entry_types": ["{{signup_type}}"], "statuses": [status], "match": "all"},
+        },
+    )
+
+
+CONFIRMED_SUBSCRIBERS = _signups_with_status(
+    "confirmed-subscribers",
+    "Confirmed subscribers",
+    "Signups confirmed in Buttondown (published). Fills itself as readers confirm; private, so sites never see it.",
+    "published",
+    "📬",
+)
+
+UNSUBSCRIBED_READERS = _signups_with_status(
+    "unsubscribed",
+    "Unsubscribed",
+    "Signups that unsubscribed in Buttondown (archived). Fills itself as readers leave; private, so sites never see it.",
+    "archived",
+    "📭",
+)
+
+CONTENT = (EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, CONFIRMED_SUBSCRIBERS, UNSUBSCRIBED_READERS)

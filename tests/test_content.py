@@ -1,4 +1,4 @@
-"""Declared content: the webhook and workflows a workspace applies from the integration's card."""
+"""Declared content: the webhook, workflows and collections a workspace applies from the integration's card."""
 
 import re
 
@@ -7,17 +7,19 @@ import pytest
 from marvin_integration_buttondown import ButtondownProvider
 from marvin_integration_buttondown.content import (
     CONFIRMED,
-    CONFIRMED_COLLECTION,
+    CONFIRMED_SUBSCRIBERS,
     CONTENT,
     EVENTS_WEBHOOK,
     ISSUE_ON_PUBLISH,
     SUBSCRIBE_ON_SIGNUP,
     UNSUBSCRIBED,
-    UNSUBSCRIBED_COLLECTION,
+    UNSUBSCRIBED_READERS,
 )
 from marvin_integration_buttondown.provider import CODE_BLOCKED, CODE_SUPPRESSED, WEBHOOK_EVENTS, ButtondownError
 
 ACTION_KEYS = {a.key for a in ButtondownProvider.actions}
+WORKFLOWS = [b for b in CONTENT if b.kind == "workflow"]
+COLLECTION_OPS = {"add_to_collection", "remove_from_collection"}
 
 
 def _definition(blueprint):
@@ -28,21 +30,28 @@ def _steps(blueprint):
     return _definition(blueprint)["actions"]
 
 
-def test_declares_the_webhook_and_workflows():
+def test_declares_the_webhook_workflows_and_collections():
     assert [(b.kind, b.slug) for b in CONTENT] == [
         ("incoming_webhook", "buttondown"),
         ("workflow", "buttondown-subscribe-on-signup"),
         ("workflow", "buttondown-subscriber-confirmed"),
         ("workflow", "buttondown-subscriber-unsubscribed"),
         ("workflow", "buttondown-issue-on-publish"),
-        ("workflow", "buttondown-confirmed-to-collection"),
-        ("workflow", "buttondown-unsubscribed-from-collection"),
+        ("collection", "confirmed-subscribers"),
+        ("collection", "unsubscribed"),
     ]
     assert ButtondownProvider.content == CONTENT
 
 
-def test_the_collection_workflows_are_suggestions_and_the_loop_is_required():
-    assert [b.slug for b in CONTENT if not b.required] == [CONFIRMED_COLLECTION.slug, UNSUBSCRIBED_COLLECTION.slug]
+def test_the_collections_are_suggestions_and_the_loop_is_required():
+    assert [b.slug for b in CONTENT if not b.required] == [CONFIRMED_SUBSCRIBERS.slug, UNSUBSCRIBED_READERS.slug]
+
+
+def test_no_workflow_maintains_a_collection():
+    # Membership follows the signup's status through smart rules, so no step adds or removes it by hand.
+    ops = {step.get("op") for b in WORKFLOWS for step in _steps(b) + _definition(b).get("on_failure", [])}
+    assert not ops & COLLECTION_OPS
+    assert "collection" not in {p["key"] for b in CONTENT for p in b.parameters}
 
 
 def test_the_webhook_requires_the_buttondown_signature():
@@ -63,7 +72,7 @@ def test_connect_webhooks_subscribes_to_exactly_the_events_the_workflows_handle(
 
 
 def test_every_integration_step_calls_a_declared_action_of_the_parameterised_connection():
-    for blueprint in CONTENT[1:]:
+    for blueprint in WORKFLOWS:
         for step in _steps(blueprint):
             if step["kind"] == "integration":
                 assert step["action"] in ACTION_KEYS and step["integration"] == "{{integration}}"
@@ -104,11 +113,55 @@ def test_confirmed_publishes_and_unsubscribed_archives_the_signup_entry():
     assert _subscriber_event_shape(UNSUBSCRIBED, "subscriber.unsubscribed")["op"] == "archive"
 
 
-def test_the_collection_workflows_add_on_confirm_and_remove_on_unsubscribe():
-    add = _subscriber_event_shape(CONFIRMED_COLLECTION, "subscriber.confirmed")
-    remove = _subscriber_event_shape(UNSUBSCRIBED_COLLECTION, "subscriber.unsubscribed")
-    assert (add["op"], add["collection_slug"]) == ("add_to_collection", "{{collection}}")
-    assert (remove["op"], remove["collection_slug"]) == ("remove_from_collection", "{{collection}}")
+# --- smart collections: membership follows the signup's status ---------------------------------------
+
+_PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+
+def _substitute(value, params):
+    """Marvin's blueprint `{{key}}` substitution: a lone placeholder becomes the value itself."""
+    if isinstance(value, str):
+        whole = _PLACEHOLDER.fullmatch(value.strip())
+        if whole and whole.group(1) in params:
+            return params[whole.group(1)]
+        return _PLACEHOLDER.sub(lambda m: str(params.get(m.group(1), m.group(0))), value)
+    if isinstance(value, list):
+        return [_substitute(v, params) for v in value]
+    if isinstance(value, dict):
+        return {k: _substitute(v, params) for k, v in value.items()}
+    return value
+
+
+def test_every_placeholder_is_a_declared_parameter():
+    for blueprint in CONTENT:
+        used = set(_PLACEHOLDER.findall(repr((blueprint.slug, blueprint.name, blueprint.payload))))
+        assert used <= {p["key"] for p in blueprint.parameters}, blueprint.slug
+
+
+@pytest.mark.parametrize(
+    "blueprint,slug,status",
+    [(CONFIRMED_SUBSCRIBERS, "confirmed-subscribers", "published"), (UNSUBSCRIBED_READERS, "unsubscribed", "archived")],
+)
+def test_collection_is_a_private_smart_collection_of_signups_in_one_status(blueprint, slug, status):
+    assert (blueprint.kind, blueprint.slug) == ("collection", slug)
+    assert [p["key"] for p in blueprint.parameters] == ["signup_type"]
+    payload = blueprint.payload
+    # Private: confirms and unsubscribes never rebuild a site, and the publishing API never lists readers.
+    assert (payload["is_smart"], payload["is_public"]) == (True, False)
+    assert payload["smart_rules"] == {"entry_types": ["{{signup_type}}"], "statuses": [status], "match": "all"}
+
+
+def test_signup_type_resolves_inside_the_smart_rules():
+    for blueprint, status in ((CONFIRMED_SUBSCRIBERS, "published"), (UNSUBSCRIBED_READERS, "archived")):
+        rules = _substitute(blueprint.payload, {"signup_type": "mailing-list"})["smart_rules"]
+        assert rules == {"entry_types": ["mailing-list"], "statuses": [status], "match": "all"}
+
+
+def test_the_collections_split_signups_by_the_statuses_the_workflows_set():
+    # Confirmed publishes and unsubscribed archives; the collections must read exactly those statuses.
+    status_after = {"publish": "published", "archive": "archived"}
+    assert CONFIRMED_SUBSCRIBERS.payload["smart_rules"]["statuses"] == [status_after[_steps(CONFIRMED)[-1]["op"]]]
+    assert UNSUBSCRIBED_READERS.payload["smart_rules"]["statuses"] == [status_after[_steps(UNSUBSCRIBED)[-1]["op"]]]
 
 
 def test_issue_workflow_creates_the_email_once_and_records_its_id():

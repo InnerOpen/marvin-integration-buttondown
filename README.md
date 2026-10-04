@@ -47,7 +47,7 @@ button sends *unsigned* requests, so Marvin rejects those with a 401. Real event
 ## What a workspace gets — declared, applied from the integration's card
 
 Nothing is created on install. **Apply** creates only what is missing. The webhook and workflows arrive
-switched off, and each can stay off on its own.
+switched off, and each can stay off on its own. The two collections are optional.
 
 | Kind | Slug | What it does |
 |---|---|---|
@@ -56,20 +56,27 @@ switched off, and each can stay off on its own.
 | workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
-| workflow *(suggestion)* | `buttondown-confirmed-to-collection` | `subscriber.confirmed` → add the signup entry to a collection (default `confirmed-subscribers`); skipped when there is no entry. |
-| workflow *(suggestion)* | `buttondown-unsubscribed-from-collection` | `subscriber.unsubscribed` → remove it from that collection. |
+| collection *(suggestion)* | `confirmed-subscribers` | **Confirmed subscribers.** Smart, private: signup-type entries that are `published`. Rules: `{"entry_types": ["<signup_type>"], "statuses": ["published"], "match": "all"}`. |
+| collection *(suggestion)* | `unsubscribed` | **Unsubscribed.** Smart, private: signup-type entries that are `archived`. Rules: `{"entry_types": ["<signup_type>"], "statuses": ["archived"], "match": "all"}`. |
+
+The collections need no workflow. The confirm and unsubscribe workflows already set the signup's status,
+and a smart collection's membership follows the status, so a reader moves from one to the other on their
+own. Both are private (**Visible to sites** off), so a confirm or unsubscribe never rebuilds a site and
+the publishing API never lists your readers. Applying a collection fills it straight away from the
+signups you already have.
 
 Parameters, asked when you apply:
 
 - `integration`: the Buttondown connection. Default `buttondown`.
 - `signup_type`: the signup form's submittable entry type. Default `newsletter`.
 - `issue_type`: the issue entry type. Default `newsletter-issue`. Its `body` and `preview` fields make the email.
-- `collection`: only for the two suggestions. It must exist.
 
 ## Setting it up
 
 1. Store the API key as a workspace secret. Connect the integration with `{{BUTTONDOWN_API_KEY}}` and pick the **Issue delivery**. Set a **Site URL** only if the workspace has no Canonical URL.
-2. **Apply** the content.
+2. **Apply** the content. Skip the two collections if you don't want them. If the workspace already has a
+   collection called `confirmed-subscribers` or `unsubscribed`, Apply leaves it alone; see
+   [Upgrading from 0.2](#upgrading-from-02-collection-workflows--smart-collections).
 3. Open the `buttondown` incoming webhook (Automation → Incoming webhooks). Click **Mint token** and copy the URL. Under **Signing**, click **Change**, keep the secret `BUTTONDOWN_SIGNING_KEY` and click **Generate key**. You can skip this if the workspace already has that secret. You don't paste the key anywhere: the next step hands it to Buttondown.
 4. On the integration's card, run **Connect Buttondown webhooks** with:
    - **webhook_url**: the URL from step 3
@@ -88,6 +95,36 @@ Buttondown webhooks belong to the account, so every workspace on the account get
 Each workspace then receives every confirm and unsubscribe on the account, including readers who signed up through another workspace's site. Those readers have no signup entry in this workspace, so the entry step skips them (`if_none: skip`) and the run stays green.
 
 If a hook token is rotated, run **Connect Buttondown webhooks** again with the new URL and the old one as `remove_legacy_url`.
+
+## Upgrading from 0.2: collection workflows → smart collections
+
+0.2 offered two optional workflows, `buttondown-confirmed-to-collection` and
+`buttondown-unsubscribed-from-collection`, that added a signup to a collection on confirm and removed it
+on unsubscribe. 0.3 drops them for the two smart collections above. The integration's card no longer
+lists the old workflows, but a workspace that applied them keeps them (and they keep running if they
+are on) until you delete them.
+
+Apply never overwrites, and a collection can't be updated from its blueprint (only workflows can). So
+in a workspace that already has a collection with either slug, the card shows it as already applied,
+and applying reports `a collection with slug '…' already exists — left as it is`. Nothing is
+converted. Switch it by hand:
+
+1. Automation → Workflows: delete `buttondown-confirmed-to-collection` and
+   `buttondown-unsubscribed-from-collection` (or whatever you called the hand-built ones).
+2. Collections → `confirmed-subscribers` → **Edit**:
+   - tick **Smart Collection**, keep **Collect: Entries**
+   - on the **Builder** tab, pick your signup entry type (e.g. `newsletter`) and the status
+     **published**, matching **all**. Or paste on the **JSON** tab:
+     `{"entry_types": ["newsletter"], "statuses": ["published"], "match": "all"}`. The builder leaves
+     out `"match": "all"` because it's the default; the rules are the same.
+   - untick **Visible to sites**
+   - save. Membership is recomputed from the rules on save. Anything added by hand that doesn't match
+     is dropped, and every published signup is added.
+3. Do the same for `unsubscribed` with the status **archived**:
+   `{"entry_types": ["newsletter"], "statuses": ["archived"], "match": "all"}`.
+
+Or delete the old collections and **Apply** the two from the card instead, if nothing else uses them.
+A workspace without either collection just applies them.
 
 ## Known limits
 

@@ -1,6 +1,6 @@
 [project]
 name = "marvin-integration-buttondown"
-version = "0.2.0"
+version = "0.3.0"
 description = "Buttondown integration for Marvin — newsletter signups become Buttondown subscribers, confirm/unsubscribe sync back, and published issues become Buttondown drafts (or sends)."
 readme = "README.md"
 requires-python = ">=3.11"

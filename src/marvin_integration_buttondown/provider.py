@@ -200,6 +200,7 @@ class ButtondownProvider(IntegrationProvider):
     )
     category = CATEGORY_DESTINATION
     icon = "📮"
+    logo = "logo.svg"
 
     content = CONTENT
     error_policy: ClassVar[ErrorPolicy] = ERROR_POLICY

@@ -155,6 +155,10 @@ A workspace without either collection just applies them.
 - Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox.
 - **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
+## Logo
+
+`logo.svg` is Buttondown's logo, unmodified, from the press kit at [buttondown.com/brand](https://buttondown.com/brand). Buttondown asks that it not be altered or recoloured, not be used to imply a business relationship, and be shown only on a white or black background.
+
 ## Develop
 
 ```

@@ -36,7 +36,8 @@ def is_relative(url: str) -> bool:
     return bool(url) and not (_SCHEME.match(url) or url.startswith(("//", "#", "{", "$")))
 
 
-def _absolute(url: str, base: str) -> str:
+def absolutize_url(url: str, base: str) -> str:
+    """One URL made absolute against ``base`` (normalised); absolute and special URLs are returned as-is."""
     # Relative to the site root, whatever page the link was written on: `works/x` and `/works/x` agree.
     return urljoin(base, url.lstrip("/")) if is_relative(url) else url
 
@@ -45,9 +46,9 @@ def absolutize_links(body: str, base_url: str) -> str:
     """``body`` with every relative link made absolute against ``base_url`` (already normalised)."""
     if not body or not base_url:
         return body
-    body = _MD_INLINE.sub(lambda m: m.group(1) + _absolute(m.group(2), base_url), body)
-    body = _MD_REFERENCE.sub(lambda m: m.group(1) + _absolute(m.group(2), base_url), body)
-    return _HTML_ATTR.sub(lambda m: f"{m.group(1)}{m.group(2)}{_absolute(m.group(3), base_url)}{m.group(2)}", body)
+    body = _MD_INLINE.sub(lambda m: m.group(1) + absolutize_url(m.group(2), base_url), body)
+    body = _MD_REFERENCE.sub(lambda m: m.group(1) + absolutize_url(m.group(2), base_url), body)
+    return _HTML_ATTR.sub(lambda m: f"{m.group(1)}{m.group(2)}{absolutize_url(m.group(3), base_url)}{m.group(2)}", body)
 
 
 def has_relative_links(body: str) -> bool:

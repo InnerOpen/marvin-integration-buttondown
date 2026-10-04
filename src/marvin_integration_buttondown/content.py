@@ -1,22 +1,28 @@
 """What a workspace needs to run its newsletter through Buttondown — declared for the core to offer.
 
 Applying (from the integration's card) creates only what is missing: the incoming webhook Buttondown
-posts subscriber events to, and four workflows. Webhooks and workflows arrive switched off; turning
-them on after a review is the deliberate last step — and each can stay off on its own.
+posts subscriber events to, four workflows, and two optional ones for a confirmed readers' collection.
+Webhooks and workflows arrive switched off; turning them on after a review is the deliberate last
+step — and each can stay off on its own.
 
 The loop (Marvin is the list of record; a signup entry's status mirrors Buttondown):
   a site signup (a `newsletter` form submission, not flagged as spam) → `subscribe` → the subscriber's
   API id stored on the entry as `buttondown_subscriber_id` (the entry waits in the inbox, pending)
   → the reader confirms → Buttondown posts `subscriber.confirmed` → `lookup_subscriber` turns the
   webhook's UUID into the API id → the entry with that id is published. `subscriber.unsubscribed`
-  archives it the same way.
+  archives it the same way. A reader with no signup entry here (subscribed elsewhere) is skipped.
   Publishing a `newsletter-issue` entry → `create_issue_email` (draft by default; see the connection's
-  Issue delivery) → the email's id stored on the entry as `buttondown_email_id`, so a republish
-  never makes a second email.
+  Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
+  `buttondown_email_id`, so a republish never makes a second email.
 
-Three parameters: `integration` (this integration's slug in the workspace, default `buttondown`),
+Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
+step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
+signup entry fails the step).
+
+Parameters: `integration` (this integration's slug in the workspace, default `buttondown`),
 `signup_type` (the signup form's entry type, default `newsletter`) and `issue_type` (the issue
-entry type, default `newsletter-issue`, whose `body` and `preview` fields make the email).
+entry type, default `newsletter-issue`, whose `body` and `preview` fields make the email), plus
+`collection` for the two optional workflows.
 """
 
 from marvin_integration_sdk import ContentBlueprint
@@ -118,7 +124,8 @@ def _subscriber_event(
     """A Buttondown subscriber event → ``step`` on the signup entry with that subscriber's API id.
 
     Webhooks carry a UUID the API never returns, so the entry can't be matched on it directly:
-    `lookup_subscriber` resolves it to the `sub_` id the signup workflow stored."""
+    `lookup_subscriber` resolves it to the `sub_` id the signup workflow stored. No matching entry
+    (a reader who subscribed outside the site) ends the step quietly; two (a repeat signup) fail it."""
     return ContentBlueprint(
         kind="workflow",
         slug=slug,
@@ -145,6 +152,8 @@ def _subscriber_event(
                     {
                         **step,
                         "kind": "entry",
+                        # A reader who joined some other way has no signup entry here: a quiet no-op, not a failed run.
+                        "if_none": "skip",
                         "entity_query": {
                             "entry_type": "{{signup_type}}",
                             "metadata": {SUBSCRIBER_ID_KEY: "${steps.lookup.output.subscriber_id}"},
@@ -219,6 +228,7 @@ ISSUE_ON_PUBLISH = ContentBlueprint(
                         "subject": "${entry.title}",
                         "body": "${entry.data.body}",
                         "description": "${entry.data.preview}",
+                        "canonical_url": "${entry.url}",
                         "entry_id": "${entry.id}",
                         "email_id": f"${{entry.metadata.{EMAIL_ID_KEY}}}",
                         # Blank when the workspace has no Canonical URL (or Marvin predates ${site.url}).

@@ -78,6 +78,8 @@ def _subscriber_event_shape(blueprint, event_type):
     assert lookup["action"] == "lookup_subscriber" and lookup["args"] == {"subscriber": "${event.payload.data.subscriber}"}
     # The webhook's UUID is resolved to the stored sub_ id before the entry is matched.
     assert act["entity_query"] == {"entry_type": "{{signup_type}}", "metadata": {"buttondown_subscriber_id": "${steps.lookup.output.subscriber_id}"}}
+    # A reader who subscribed outside the site has no signup entry: skipped quietly, not a failed run.
+    assert act["if_none"] == "skip"
     return act
 
 
@@ -102,6 +104,7 @@ def test_issue_workflow_creates_the_email_once_and_records_its_id():
     assert create["args"]["entry_id"] == "${entry.id}"
     assert create["args"]["email_id"] == "${entry.metadata.buttondown_email_id}"
     assert create["args"]["site_url"] == "${site.url}"
+    assert create["args"]["canonical_url"] == "${entry.url}"
     assert record["op"] == "set_metadata"
     assert record["metadata"]["buttondown_email_id"] == "${steps.issue.output.email_id}"
     # Never blank, so the step succeeds when delivery is off and there is no email id.

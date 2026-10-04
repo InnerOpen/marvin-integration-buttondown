@@ -32,7 +32,7 @@ from marvin_integration_sdk import (
 )
 
 from .content import CONTENT
-from .links import absolutize_links, has_relative_links, normalise_base_url
+from .links import absolutize_links, absolutize_url, has_relative_links, is_relative, normalise_base_url
 
 API = "https://api.buttondown.com/v1"
 ERROR_TEXT_LIMIT = 300
@@ -181,6 +181,10 @@ class ButtondownProvider(IntegrationProvider):
                     "subject": _STR,
                     "body": {"type": "string", "description": "The issue in Markdown. Relative links are made absolute against the site URL."},
                     "description": {"type": "string", "description": "The preview text / archive description."},
+                    "canonical_url": {
+                        "type": "string",
+                        "description": "The issue's page on your site (the workflow passes ${entry.url}); a site path is made absolute against the site URL.",
+                    },
                     "entry_id": {"type": "string", "description": "The Marvin entry — recorded on the email so it is created only once."},
                     "email_id": {
                         "type": "string",
@@ -331,6 +335,14 @@ class ButtondownProvider(IntegrationProvider):
         """The connection's Site URL if set (a deliberate choice), else the workspace's, as the workflow passed it."""
         return normalise_base_url(_text((ctx.config or {}).get("site_url")) or _text(args.get("site_url")))
 
+    @staticmethod
+    def _canonical_url(args: dict, base: str) -> str:
+        """The issue's own page as an absolute URL, or "" — Buttondown refuses a relative canonical_url."""
+        url = _text(args.get("canonical_url"))
+        if url and is_relative(url):
+            url = absolutize_url(url, base) if base else ""
+        return url if url.startswith(("https://", "http://")) else ""
+
     def _create_issue_email(self, args: dict, ctx: IntegrationContext) -> dict:
         delivery = self._delivery(ctx)
         email_id, entry_id = _text(args.get("email_id")), _text(args.get("entry_id"))
@@ -366,6 +378,8 @@ class ButtondownProvider(IntegrationProvider):
         }
         if description := _text(args.get("description")):
             payload["description"] = description
+        if canonical := self._canonical_url(args, base):
+            payload["canonical_url"] = canonical
         if entry_id:
             payload["metadata"] = {ENTRY_METADATA_KEY: entry_id}
 

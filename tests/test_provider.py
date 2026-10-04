@@ -237,6 +237,25 @@ def test_create_issue_email_without_a_site_url_keeps_links_and_warns(caplog):
     assert "](/works/blue)" in http.posted("/emails")["json"]["body"] and "relative links" in caplog.text
 
 
+def test_create_issue_email_sends_an_absolute_canonical_url():
+    http = _emails()
+    _run(http, "create_issue_email", canonical_url="https://example.com/notes/hello", **ISSUE)
+    assert http.posted("/emails")["json"]["canonical_url"] == "https://example.com/notes/hello"
+
+
+def test_create_issue_email_makes_a_site_path_canonical_url_absolute():
+    http = _emails()
+    _run(http, "create_issue_email", config={"site_url": "https://example.com"}, canonical_url="/notes/hello", **ISSUE)
+    assert http.posted("/emails")["json"]["canonical_url"] == "https://example.com/notes/hello"
+
+
+@pytest.mark.parametrize("canonical", ["/notes/hello", "", "${entry.url}"])
+def test_create_issue_email_omits_a_canonical_url_it_cannot_make_absolute(canonical):
+    http = _emails()
+    _run(http, "create_issue_email", canonical_url=canonical, **ISSUE)
+    assert "canonical_url" not in http.posted("/emails")["json"]
+
+
 def test_create_issue_email_returns_the_recorded_email_instead_of_a_second_one():
     http = _emails(existing=EMAIL)
     out = _run(http, "create_issue_email", email_id="em_1", **ISSUE)

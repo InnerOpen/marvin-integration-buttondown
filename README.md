@@ -25,7 +25,7 @@ if the key is rejected or the config is invalid.
 |---|---|
 | `subscribe` | `email`, optional `tags`, `ip_address` (helps Buttondown's spam firewall), `metadata`, `notes`, `referrer_url`. Returns `subscriber_id` (the API's `sub_…`), `email`, `type`, `already_subscribed`. An address that's already subscribed returns the existing subscriber. You get a readable error when Buttondown's firewall refuses the address (`subscriber_blocked`, `email_blocked`, `ip_address_spammy`) or when it unsubscribed before (`subscriber_suppressed`). |
 | `lookup_subscriber` | `subscriber`: a webhook's UUID, a `sub_` id or an email. Returns `subscriber_id`, `email`, `type`. Buttondown gives a subscriber two ids: the API returns `sub_…` and webhooks carry a UUID. This turns either one into the `sub_` id. |
-| `create_issue_email` | `subject`, `body` (Markdown), `description` (preview text), `entry_id`, `email_id`, `site_url`. Follows **Issue delivery**. Runs once per entry: if `email_id` (the entry's stored `buttondown_email_id`) still exists in Buttondown, or an email carries `metadata.marvin_entry_id` for this entry, that email is returned with `skipped: true` and no second email is made. The body is sent with Buttondown's Markdown editor-mode marker. Every create names its status, because Buttondown's own default is `about_to_send` (send). |
+| `create_issue_email` | `subject`, `body` (Markdown), `description` (preview text), `canonical_url`, `entry_id`, `email_id`, `site_url`. Follows **Issue delivery**. `canonical_url` (the workflow passes `${entry.url}`, the issue's page on your site) is sent to Buttondown when it is, or can be made, absolute; otherwise it is left out. Runs once per entry: if `email_id` (the entry's stored `buttondown_email_id`) still exists in Buttondown, or an email carries `metadata.marvin_entry_id` for this entry, that email is returned with `skipped: true` and no second email is made. The body is sent with Buttondown's Markdown editor-mode marker. Every create names its status, because Buttondown's own default is `about_to_send` (send). |
 
 Every failure, network errors included, raises a readable error, so the workflow step fails visibly.
 
@@ -42,10 +42,10 @@ switched off, and each can stay off on its own.
 |---|---|---|
 | incoming webhook | `buttondown` | Where Buttondown posts subscriber events (scheme `buttondown`, secret `BUTTONDOWN_SIGNING_KEY`). |
 | workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. |
-| workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. |
-| workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive**. |
-| workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
-| workflow *(suggestion)* | `buttondown-confirmed-to-collection` | `subscriber.confirmed` → add the signup entry to a collection (default `confirmed-subscribers`). |
+| workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
+| workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
+| workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
+| workflow *(suggestion)* | `buttondown-confirmed-to-collection` | `subscriber.confirmed` → add the signup entry to a collection (default `confirmed-subscribers`); skipped when there is no entry. |
 | workflow *(suggestion)* | `buttondown-unsubscribed-from-collection` | `subscriber.unsubscribed` → remove it from that collection. |
 
 Parameters, asked when you apply:
@@ -65,9 +65,9 @@ Parameters, asked when you apply:
 
 ## Known limits
 
-- A confirm or unsubscribe can find no matching entry: the reader subscribed somewhere other than the site, or a repeat signup left two entries. Either way the entry step fails, and you see it as a failed run.
-- An address that unsubscribed before can't rejoin from a signup (`subscriber_suppressed`). Buttondown needs a manual re-add or re-confirmation.
-- `${site.url}` needs a Marvin that provides it. On an older Marvin it is blank, so set the connection's Site URL.
+- A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id, the step fails rather than guess.
+- **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed` and the signup workflow's subscribe step fails with that reason (the signup entry stays in the inbox). To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
+- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step.
 
 ## Develop
 

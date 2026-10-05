@@ -11,6 +11,12 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   → the reader confirms → Buttondown posts `subscriber.confirmed` → `lookup_subscriber` turns the
   webhook's UUID into the API id → the entry with that id is published. `subscriber.unsubscribed`
   archives it the same way. A reader with no signup entry here (subscribed elsewhere) is skipped.
+  One entry per reader: set the signup type's **Same person = same …** to its email field
+  (`capabilities.submission.matchField: "email"`, Marvin's one-entry-per-person setting). A repeat signup
+  then updates the reader's entry instead of adding a second one, and the signup workflow skips a repeat
+  from a reader already confirmed (previous status `published`) — no second subscribe for someone on the
+  list. A repeat that reopened an unsubscribed (archived) entry, or one still pending, subscribes again;
+  Buttondown answers that idempotently.
   A signup Buttondown refuses (spam firewall, an earlier unsubscribe) or that fails otherwise goes to
   Needs review instead of waiting in the inbox like a pending one. That is the provider's error policy
   (see `ButtondownProvider.error_policy`), applied by Marvin, not workflow steps: Marvin records the
@@ -19,6 +25,10 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   Publishing a `newsletter-issue` entry → `create_issue_email` (draft by default; see the connection's
   Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
   `buttondown_email_id`, so a republish never makes a second email.
+
+Apply can't set the match field (a blueprint can add fields to an entry type, not change its submission
+settings), so it is a suggestion: the signup-type parameter's help and the signup workflow say so.
+Without it every signup is its own entry, as before, and the duplicate condition never matches.
 
 Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
 step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
@@ -49,12 +59,18 @@ INTEGRATION_PARAM = {
     "default": "buttondown",
     "help": "The workflows call this connection's actions.",
 }
+# The signup field that identifies a reader: suggested as the signup type's match field (one entry per reader).
+SIGNUP_MATCH_FIELD = "email"
+
 SIGNUP_TYPE_PARAM = {
     "key": "signup_type",
     "label": "Which entry type are newsletter signups?",
     "kind": "entry_type",
     "default": "newsletter",
-    "help": "The submittable type your site's signup form creates entries of.",
+    "help": (
+        "The submittable type your site's signup form creates entries of. Suggested: set its Submission settings → "
+        f"Same person = same … to `{SIGNUP_MATCH_FIELD}`, so a repeat signup updates the reader's entry instead of adding a second one."
+    ),
 }
 ISSUE_TYPE_PARAM = {
     "key": "issue_type",
@@ -93,7 +109,8 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
     name="Buttondown: subscribe on signup",
     description=(
         "When the site's newsletter form is submitted (and not flagged as spam), add the address to Buttondown and remember its subscriber id "
-        "on the entry. If Buttondown refuses it, the entry goes to Needs review with the reason."
+        "on the entry. If Buttondown refuses it, the entry goes to Needs review with the reason. A repeat signup from a reader "
+        f"already confirmed is skipped — set the signup type's Same person = same … to {SIGNUP_MATCH_FIELD} so a repeat updates their entry."
     ),
     required=True,
     category=CATEGORY,
@@ -105,6 +122,10 @@ SUBSCRIBE_ON_SIGNUP = ContentBlueprint(
                 {"field": "entry.entry_type", "op": "eq", "value": "{{signup_type}}"},
                 # A flagged signup (disposable domain etc.) stays in Needs review and is never forwarded.
                 {"field": "event.flagged", "op": "neq", "value": True},
+                # One entry per reader (the signup type's match field): a repeat from someone already confirmed
+                # (published) is skipped. A reopened (archived → inbox) or still-pending one subscribes again, which
+                # Buttondown answers idempotently. Not a duplicate, or a Marvin without the field: no previous status.
+                {"field": "event.previous_status", "op": "neq", "value": "published"},
             ],
             "actions": [
                 {
@@ -133,7 +154,8 @@ def _subscriber_event(slug: str, name: str, description: str, event_type: str, s
 
     Webhooks carry a UUID the API never returns, so the entry can't be matched on it directly:
     `lookup_subscriber` resolves it to the `sub_` id the signup workflow stored. No matching entry
-    (a reader who subscribed outside the site) ends the step quietly; two (a repeat signup) fail it."""
+    (a reader who subscribed outside the site) ends the step quietly; two (repeat signups from before the
+    signup type had a match field) fail it."""
     return ContentBlueprint(
         kind="workflow",
         slug=slug,

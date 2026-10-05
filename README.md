@@ -72,7 +72,7 @@ switched off, and each can stay off on its own. The two collections are optional
 | Kind | Slug | What it does |
 |---|---|---|
 | incoming webhook | `buttondown` | Where Buttondown posts subscriber events (scheme `buttondown`, secret `BUTTONDOWN_SIGNING_KEY`). |
-| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails**, the error policy above applies: a refusal goes straight to **Needs review** with the reason; an outage or rate limit is retried first. |
+| workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged, and not a repeat from a reader already confirmed (`event.previous_status` ≠ `published`, see [One entry per reader](#one-entry-per-reader)) → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails**, the error policy above applies: a refusal goes straight to **Needs review** with the reason; an outage or rate limit is retried first. |
 | workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
@@ -88,7 +88,7 @@ signups you already have.
 Parameters, asked when you apply:
 
 - `integration`: the Buttondown connection. Default `buttondown`.
-- `signup_type`: the signup form's submittable entry type. Default `newsletter`.
+- `signup_type`: the signup form's submittable entry type. Default `newsletter`. Suggested: match readers by `email` on it (see [One entry per reader](#one-entry-per-reader)).
 - `issue_type`: the issue entry type. Default `newsletter-issue`. Its `body` and `preview` fields make the email.
 
 ## Setting it up
@@ -105,8 +105,24 @@ Parameters, asked when you apply:
    - **label** (optional): the workspace name
 5. Switch on the `buttondown` incoming webhook and the workflows you want. A provider can't switch Marvin's webhooks on, so this one is a click.
 6. If you had an older hand-built Buttondown hook in Marvin, delete it (Automation → Incoming webhooks).
+7. Open the signup entry type (e.g. `newsletter`) and, under **Submission settings**, set **Same person = same …** to `email`. See [One entry per reader](#one-entry-per-reader).
 
-Repeat steps 3–6 in **every workspace that shares the Buttondown account**.
+Repeat steps 3–7 in **every workspace that shares the Buttondown account**.
+
+### One entry per reader
+
+Marvin can keep one entry per person for a submittable type: its match field (`capabilities.submission.matchField`, **Same person = same …** in the editor). Set it to `email` on the signup type and a repeat signup updates the reader's entry instead of adding a second one. Apply can't set it for you (a blueprint can add fields to an entry type, not change its submission settings), so it's step 7 above. Or set it through the API: `PATCH` the entry type with `capabilitiesJson.submission.matchField: "email"`, keeping its other capabilities.
+
+With it set, the signup workflow (0.6.0+) handles a repeat by what the reader's entry was before:
+
+| Previous status | What happens |
+|---|---|
+| none (a first signup) | Subscribe, as always. |
+| `inbox` (still pending) | Subscribe again. Buttondown answers it idempotently. |
+| `archived` (unsubscribed) | Marvin reopens the entry to the inbox and the workflow subscribes again. If Buttondown suppresses the address, the entry goes to Needs review (see [Known limits](#known-limits)). |
+| `published` (confirmed) | Skipped. They're already on the list; no second subscribe. |
+
+A flagged repeat is never forwarded: Marvin files it as its own `needs_review` entry and leaves the reader's entry alone. Without the match field every signup is its own entry, as before, and the new condition never matches.
 
 ### Several workspaces, one Buttondown account
 
@@ -148,11 +164,12 @@ A workspace without either collection just applies them.
 
 ## Known limits
 
-- A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id, the step fails rather than guess.
+- A confirm or unsubscribe for a reader with no signup entry here (they subscribed some other way) is a quiet no-op: the entry step's output says `skipped: true, reason: "no matching entry"`. If a repeat signup left **two** entries with the same subscriber id (from before the signup type had a match field), the step fails rather than guess. Merge or delete the extra one; with [one entry per reader](#one-entry-per-reader) set it doesn't happen again.
 - **A refused signup goes to Needs review; a refusal is never retried.** When Buttondown refuses an address, the signup workflow's run fails (it shows under **Runs**) and the error policy moves the entry to **Needs review** with the reason, which the Review Queue's card shows. Look at the entry: a firewall refusal (`blocked` / `spammy`) is usually spam you can archive; a real reader can be added by hand in Buttondown. Only an outage, a rate limit or a rejected key is retried (see the table above); an `unknown` failure goes to review straight away.
-- **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed`, the run fails and the entry goes to Needs review with code `suppressed`. To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual.
+- **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed`, the run fails and the entry goes to Needs review with code `suppressed`. To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual. With [one entry per reader](#one-entry-per-reader) the rejoin attempt reopens their archived entry instead of adding a new one, so it's that entry that goes to Needs review.
 - Updating a Buttondown webhook in place needs a Marvin whose integration HTTP helper has PATCH. On an older Marvin, `connect_webhooks` replaces the webhook instead: it creates the new one, then deletes the old one (`result: replaced`). The outcome is the same, but the webhook gets a new id.
-- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox.
+- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox. One entry per reader needs a Marvin with the submission match field; on an older one every signup is its own entry and the `previous_status` condition always passes.
+- **Upgrading to 0.6.0:** the signup workflow gained the `previous_status` condition. The card marks an applied copy with **↑**; click **Update** to pick it up (whether it's switched on is kept), then do step 7.
 - **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
 ## Logo

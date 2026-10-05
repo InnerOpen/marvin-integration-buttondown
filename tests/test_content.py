@@ -12,6 +12,8 @@ from marvin_integration_buttondown.content import (
     CONTENT,
     EVENTS_WEBHOOK,
     ISSUE_ON_PUBLISH,
+    SIGNUP_MATCH_FIELD,
+    SIGNUP_TYPE_PARAM,
     SUBSCRIBE_ON_SIGNUP,
     UNSUBSCRIBED,
     UNSUBSCRIBED_READERS,
@@ -227,3 +229,59 @@ def test_the_other_workflows_never_send_their_entry_to_review(blueprint):
         for code in CALL_CODES:
             handle = resolve_policy(ButtondownProvider, step["action"], code)
             assert handle is not None and not handle.review and not (handle.then and handle.then.review), (step["action"], code)
+
+
+# ── One entry per reader (Marvin's match field on the signup type) ───────────────────────────────
+
+
+def _passes(conditions, event: dict) -> bool:
+    """The signup workflow's conditions against an event, with Marvin's eq/neq (a missing field is None)."""
+
+    def resolve(path):
+        node = {"event": event, "entry": {"entry_type": "{{signup_type}}"}}
+        for part in path.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        return node
+
+    ops = {"eq": lambda a, b: a == b, "neq": lambda a, b: a != b}
+    return all(ops[c["op"]](resolve(c["field"]), c["value"]) for c in conditions)
+
+
+def test_signup_skips_a_repeat_from_a_reader_already_confirmed():
+    conditions = _definition(SUBSCRIBE_ON_SIGNUP)["conditions"]
+    assert {"field": "event.previous_status", "op": "neq", "value": "published"} in conditions
+
+
+@pytest.mark.parametrize(
+    ("event", "subscribes"),
+    [
+        ({"flagged": False}, True),  # a first signup, or a Marvin without the duplicate fields
+        ({"flagged": False, "duplicate": True, "previous_status": "inbox"}, True),  # still pending: subscribe again
+        ({"flagged": False, "duplicate": True, "previous_status": "archived"}, True),  # unsubscribed, signed up again
+        ({"flagged": False, "duplicate": True, "previous_status": "published"}, False),  # already confirmed
+        ({"flagged": True, "duplicate": False, "previous_status": "published"}, False),  # flagged: never forwarded
+    ],
+)
+def test_which_signups_subscribe(event, subscribes):
+    assert _passes(_definition(SUBSCRIBE_ON_SIGNUP)["conditions"], event) is subscribes
+
+
+def test_the_signup_type_is_told_to_match_readers_by_the_subscribed_email_field():
+    assert SIGNUP_MATCH_FIELD == "email"
+    # The field suggested as the match field is the one the workflow subscribes.
+    (subscribe,) = _integration_steps(SUBSCRIBE_ON_SIGNUP)
+    assert subscribe["args"]["email"] == f"${{event.submission_data.{SIGNUP_MATCH_FIELD}}}"
+    # Suggested wherever the content describes the signup type: the parameter and the signup workflow.
+    assert "Same person = same" in SIGNUP_TYPE_PARAM["help"] and f"`{SIGNUP_MATCH_FIELD}`" in SIGNUP_TYPE_PARAM["help"]
+    assert "Same person = same" in SUBSCRIBE_ON_SIGNUP.description and SIGNUP_MATCH_FIELD in SUBSCRIBE_ON_SIGNUP.description
+    assert all(p is SIGNUP_TYPE_PARAM for b in CONTENT for p in b.parameters if p["key"] == "signup_type")
+
+
+def test_version_is_0_6_0_everywhere():
+    import tomllib
+    from pathlib import Path
+
+    import marvin_integration_buttondown
+
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.6.0"

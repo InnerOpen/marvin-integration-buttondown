@@ -277,11 +277,11 @@ def test_the_signup_type_is_told_to_match_readers_by_the_subscribed_email_field(
     assert all(p is SIGNUP_TYPE_PARAM for b in CONTENT for p in b.parameters if p["key"] == "signup_type")
 
 
-def test_version_is_0_6_0_everywhere():
+def test_version_is_0_7_0_everywhere():
     import tomllib
     from pathlib import Path
 
     import marvin_integration_buttondown
 
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.6.0"
+    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.7.0"

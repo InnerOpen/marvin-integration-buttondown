@@ -172,6 +172,17 @@ A workspace without either collection just applies them.
 - **Upgrading to 0.6.0:** the signup workflow gained the `previous_status` condition. The card marks an applied copy with **↑**; click **Update** to pick it up (whether it's switched on is kept), then do step 7.
 - **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
+## What it teaches Marvin (0.7.0, SDK 0.9.0)
+
+- **A guide** (`src/marvin_integration_buttondown/guide.md`): connecting it, what each action takes and returns, how
+  Issue delivery (draft or send) fits a workflow, what it can't do, and what each error code means. Marvin's agents
+  read it when building workflows where Buttondown is connected, and Marvin's manual search finds it.
+- **A recipe** in the Workflow Library, *Subscribe form submitters who opt in*: when a form other than the newsletter
+  signup (a contact or event form) is submitted with its opt-in checkbox ticked, the sender is subscribed through
+  `subscribe`. Shown as "From the Buttondown plugin 0.7.0", offered once Buttondown is connected. Marvin's own
+  *Newsletter delivery* recipe already covers the issue side, so it isn't repeated here. Confirmations and
+  unsubscribes only update signup-type entries, so a reader subscribed this way isn't tracked back on the form entry.
+
 ## Logo
 
 `logo.svg` is Buttondown's logo, unmodified, from the press kit at [buttondown.com/brand](https://buttondown.com/brand). Buttondown asks that it not be altered or recoloured, not be used to imply a business relationship, and be shown only on a white or black background.

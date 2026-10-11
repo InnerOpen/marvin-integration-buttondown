@@ -44,6 +44,7 @@ from marvin_integration_sdk import (
 
 from .content import CONTENT
 from .links import absolutize_links, absolutize_url, has_relative_links, is_relative, normalise_base_url
+from .recipes import RECIPES
 
 API = "https://api.buttondown.com/v1"
 ERROR_TEXT_LIMIT = 300
@@ -203,6 +204,10 @@ class ButtondownProvider(IntegrationProvider):
     logo = "logo.svg"
 
     content = CONTENT
+    # What Marvin learns about Buttondown (SDK 0.9.0): a how-to its agents read when building workflows here, and a
+    # ready-made workflow in the Workflow Library, offered once Buttondown is connected.
+    guide = "guide.md"
+    recipes = RECIPES
     error_policy: ClassVar[ErrorPolicy] = ERROR_POLICY
 
     # Buttondown signs with HMAC-SHA256 over the raw body: `X-Buttondown-Signature: sha256=<hex>`.

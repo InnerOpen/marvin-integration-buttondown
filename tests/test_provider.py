@@ -249,7 +249,15 @@ def test_create_issue_email_draft_is_the_default_delivery():
     http = _emails()
     out = _run(http, "create_issue_email", **ISSUE)
 
-    assert out == {"email_id": "em_new", "status": "draft", "delivery": "draft", "skipped": False, "reason": "", "url": "https://bd/em_new"}
+    assert out == {
+        "email_id": "em_new",
+        "status": "draft",
+        "delivery": "draft",
+        "skipped": False,
+        "sent": False,
+        "reason": "",
+        "url": "https://bd/em_new",
+    }
     assert http.posted("/emails")["json"]["status"] == "draft"
 
 
@@ -524,7 +532,7 @@ def test_info_shows_how_each_error_is_handled():
     assert policy["provider"][CODE_RATE_LIMITED]["summary"] == "retry 3× (1m, 5m, 15m), then send to review"
     assert policy["provider"][CODE_AUTH]["summary"] == "notify admins, wait for the connection to recover, then retry once, then send to review"
     assert policy["provider"][CODE_BLOCKED]["summary"] == policy["provider"]["*"]["summary"] == "send to review"
-    assert set(policy["actions"]) == {"subscribe", "lookup_subscriber", "create_issue_email", "connect_webhooks"}
+    assert set(policy["actions"]) == {"subscribe", "lookup_subscriber", "create_issue_email", "resolve_email_id", "connect_webhooks"}
     assert policy["actions"]["subscribe"] == {}  # the signup follows the provider's policy
 
 
@@ -568,7 +576,13 @@ def test_connect_webhooks_just_fails_for_the_admin_who_ran_it(code):
 
 
 def test_declared_actions_match_the_handlers():
-    assert {a.key for a in ButtondownProvider.actions} == {"subscribe", "lookup_subscriber", "create_issue_email", "connect_webhooks"}
+    assert {a.key for a in ButtondownProvider.actions} == {
+        "subscribe",
+        "lookup_subscriber",
+        "create_issue_email",
+        "resolve_email_id",
+        "connect_webhooks",
+    }
 
 
 # --- connect_webhooks -------------------------------------------------------------------------------
@@ -576,8 +590,8 @@ def test_declared_actions_match_the_handlers():
 HOOK = "https://api.example.com/api/hooks/tok_new"
 LEGACY = "https://api.example.com/api/hooks/tok_old"
 SIGNING = "whsec-123"
-EVENTS = ["subscriber.confirmed", "subscriber.unsubscribed"]
-DESCRIPTION = "Marvin: subscriber confirmations and unsubscribes"
+EVENTS = ["subscriber.confirmed", "subscriber.unsubscribed", "email.sent"]
+DESCRIPTION = "Marvin: subscriber confirmations, unsubscribes and sent emails"
 # Another workspace on the same Buttondown account and the same Marvin host — never ours to touch.
 FOREIGN = {"id": "wh_other", "url": "https://api.example.com/api/hooks/tok_other", "status": "enabled", "event_types": EVENTS}
 DESIRED = {"url": HOOK, "event_types": EVENTS, "status": "enabled", "description": DESCRIPTION, "signing_key": SIGNING}
@@ -766,3 +780,96 @@ def test_buttondown_scheme_accepts_a_real_signature():
 )
 def test_buttondown_scheme_rejects_a_bad_or_missing_signature(headers):
     assert not _verify(ButtondownProvider.signature_schemes["buttondown"], WEBHOOK_BODY, headers, "signing-key")
+
+
+# --- results: which calls are hand-offs, and the ids that match a sent email ------------------------------
+
+
+def test_create_issue_email_declares_a_hand_off_recorded_only_when_it_sent():
+    send = ButtondownProvider().get_action("create_issue_email")
+
+    assert (send.hands_off.remote_id, send.hands_off.remote_url, send.hands_off.record_if) == ("email_id", "url", "sent")
+    assert {"email_id", "url", "sent"} <= set(send.output_schema["properties"])
+
+
+def test_no_other_action_declares_a_hand_off():
+    assert [a.key for a in ButtondownProvider.actions if a.hands_off and a.key != "create_issue_email"] == []
+
+
+def test_the_hand_off_declaration_is_well_formed_for_the_sdk():
+    from marvin_integration_sdk import hands_off_problems
+
+    assert [p for a in ButtondownProvider.actions for p in hands_off_problems(a)] == []
+
+
+def test_a_send_is_the_only_call_that_says_it_sent():
+    out = _run(
+        _emails(create_body={"id": "em_new", "status": "about_to_send", "absolute_url": "https://bd/em_new"}),
+        "create_issue_email",
+        config={"issue_delivery": "send"},
+        **ISSUE,
+    )
+
+    assert out["sent"] is True and out["email_id"] == "em_new" and out["url"] == "https://bd/em_new"
+
+
+def test_a_draft_did_not_send():
+    assert _run(_emails(), "create_issue_email", config={"issue_delivery": "draft"}, **ISSUE)["sent"] is False
+
+
+def test_with_delivery_off_nothing_was_sent():
+    http = _emails()
+    out = _run(http, "create_issue_email", config={"issue_delivery": "off"}, **ISSUE)
+
+    assert out["sent"] is False and out["skipped"] is True and http.calls == []
+
+
+def test_an_email_that_already_exists_is_not_sent_again_even_in_send_mode():
+    out = _run(_emails(existing=EMAIL), "create_issue_email", config={"issue_delivery": "send"}, email_id="em_1", **ISSUE)
+
+    assert out["skipped"] is True and out["sent"] is False
+
+
+def test_a_send_buttondown_refuses_raises_so_nothing_says_it_sent():
+    http = _emails(create_status=400, create_body={"code": "sending_requires_confirmation", "detail": "Confirm sending first."})
+
+    with pytest.raises(ButtondownError, match="sending confirmed"):
+        _run(http, "create_issue_email", config={"issue_delivery": "send"}, **ISSUE)
+
+
+def test_connect_webhooks_subscribes_to_email_sent_beside_the_subscriber_events():
+    from marvin_integration_buttondown.provider import WEBHOOK_EVENTS
+
+    assert WEBHOOK_EVENTS == ("subscriber.confirmed", "subscriber.unsubscribed", "email.sent")
+
+
+# a real Buttondown email id as the API returns it and as TypeID's spec writes the same UUID (webhooks carry the UUID)
+EMAIL_UUID = "01890a5d-ac96-774b-bcce-b302099a8057"
+EMAIL_TYPEID = "em_01h455vb4pex5vsknk084sn02q"
+
+
+def test_resolve_email_id_turns_a_webhooks_uuid_into_the_id_the_api_returns_without_a_call():
+    http = _Http([])
+
+    assert _run(http, "resolve_email_id", email=EMAIL_UUID) == {"email_id": EMAIL_TYPEID}
+    assert http.calls == []
+
+
+def test_resolve_email_id_leaves_an_id_the_api_already_returned_alone():
+    assert _run(_Http([]), "resolve_email_id", email=EMAIL_TYPEID) == {"email_id": EMAIL_TYPEID}
+    assert _run(_Http([]), "resolve_email_id", email="em_1") == {"email_id": "em_1"}
+
+
+def test_resolve_email_id_reads_an_uppercase_or_braced_uuid_the_same_way():
+    assert _run(_Http([]), "resolve_email_id", email=EMAIL_UUID.upper())["email_id"] == EMAIL_TYPEID
+    assert _run(_Http([]), "resolve_email_id", email=" " + EMAIL_UUID + " ")["email_id"] == EMAIL_TYPEID
+
+
+def test_resolve_email_id_encodes_the_extremes_of_the_uuid_space():
+    assert _run(_Http([]), "resolve_email_id", email="00000000-0000-0000-0000-000000000000")["email_id"] == "em_" + "0" * 26
+    assert _run(_Http([]), "resolve_email_id", email="ffffffff-ffff-ffff-ffff-ffffffffffff")["email_id"] == "em_7" + "z" * 25
+
+
+def test_resolve_email_id_needs_an_id():
+    with pytest.raises(ButtondownError, match="needs an email id"):
+        _run(_Http([]), "resolve_email_id", email="  ")

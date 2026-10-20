@@ -65,7 +65,8 @@ Subscribers is read-only for Buttondown's part: subscribing and unsubscribing ha
 - `subject` and `body` (Markdown) are required. Optional: `description` (preview text), `canonical_url` (the issue's
   page, `${entry.url}`; a site path is made absolute), `entry_id` (`${entry.id}`), `email_id` (the entry's stored
   `buttondown_email_id`) and `site_url` (`${site.url}`; the connection's Site URL wins when set).
-- Output: `email_id`, `status`, `delivery`, `skipped`, `reason`, `url`.
+- Output: `email_id`, `status`, `delivery`, `skipped`, `sent`, `reason`, `url`. `sent` is true only when this call created
+  the email and asked Buttondown to send it.
 - It follows the connection's Issue delivery, so the same workflow drafts or sends depending on the connection.
   With delivery `off` it returns `skipped: true` and no email id. It creates one email per entry: if the entry already
   has one (found by its stored id, or by the entry id recorded on the email in Buttondown) it returns that email with
@@ -74,12 +75,20 @@ Subscribers is read-only for Buttondown's part: subscribing and unsubscribing ha
   `about_to_send`, which means it goes out to subscribers. Choose `send` only when a published issue is final.
 - Keep the step that stores `buttondown_email_id` (and `buttondown_issue_delivery`) after it; the
   **Newsletter delivery** recipe in Marvin's Workflow Library is exactly this.
+- A send is followed up under Settings > Automation > Results: Marvin records it as In flight (with the email's id) and
+  the `buttondown-email-sent` workflow marks it Succeeded when Buttondown posts `email.sent`. A draft, a skip and delivery
+  `off` are not hand-offs and record nothing. Buttondown has no event for a send that fails, so one that never
+  completes shows as No reply after a day.
+
+**Resolve email id** (`resolve_email_id`)
+- `email`: the id a webhook carries (a UUID) or an `em_` id. Output: `email_id`, the `em_` id the API returns. Makes no
+  call to Buttondown. It is how an `email.sent` event is matched to the send Marvin recorded.
 
 **Connect Buttondown webhooks** (`connect_webhooks`)
 - `webhook_url` (this workspace's `buttondown` incoming webhook URL) and `signing_key` (`{{BUTTONDOWN_SIGNING_KEY}}`)
   are required; optional `label` and `remove_legacy_url` (an old Marvin hook URL to retire).
-- Creates or updates the one Buttondown webhook that sends `subscriber.confirmed` and `subscriber.unsubscribed` to
-  Marvin. Webhooks pointing elsewhere are left alone. Output: `webhook_id`, `result` (`created`, `updated`, `replaced`
+- Creates or updates the one Buttondown webhook that sends `subscriber.confirmed`, `subscriber.unsubscribed` and
+  `email.sent` to Marvin (run it again after upgrading to 0.9 so Buttondown starts sending `email.sent`). Webhooks pointing elsewhere are left alone. Output: `webhook_id`, `result` (`created`, `updated`, `replaced`
   or `unchanged`), `removed`, `legacy_removed`. It is meant to be run by an admin; it is not retried.
 
 ## In workflows

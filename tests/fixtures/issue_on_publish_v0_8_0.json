@@ -1,0 +1,64 @@
+{
+    "slug": "buttondown-issue-on-publish",
+    "kind": "workflow",
+    "name": "Buttondown: email an issue when published",
+    "description": "When a newsletter issue is published, create its Buttondown email — a draft, or sent, as the connection's Issue delivery says — and remember the email's id on the entry, so publishing it again never makes a second one.",
+    "required": true,
+    "category": "Buttondown",
+    "parameters": [
+        {
+            "key": "issue_type",
+            "label": "Which entry type are newsletter issues?",
+            "kind": "entry_type",
+            "default": "newsletter-issue",
+            "help": "Publishing one of these creates the Buttondown email (its body and preview fields)."
+        },
+        {
+            "key": "integration",
+            "label": "Which Buttondown connection",
+            "kind": "integration",
+            "default": "buttondown",
+            "help": "The workflows call this connection's actions."
+        }
+    ],
+    "payload": {
+        "definition": {
+            "trigger": {
+                "type": "event",
+                "event": "entry_published"
+            },
+            "conditions": [
+                {
+                    "field": "entry.entry_type",
+                    "op": "eq",
+                    "value": "{{issue_type}}"
+                }
+            ],
+            "actions": [
+                {
+                    "kind": "integration",
+                    "id": "issue",
+                    "integration": "{{integration}}",
+                    "action": "create_issue_email",
+                    "args": {
+                        "subject": "${entry.title}",
+                        "body": "${entry.data.body}",
+                        "description": "${entry.data.preview}",
+                        "canonical_url": "${entry.url}",
+                        "entry_id": "${entry.id}",
+                        "email_id": "${entry.metadata.buttondown_email_id}",
+                        "site_url": "${site.url}"
+                    }
+                },
+                {
+                    "kind": "entry",
+                    "op": "set_metadata",
+                    "metadata": {
+                        "buttondown_email_id": "${steps.issue.output.email_id}",
+                        "buttondown_issue_delivery": "${steps.issue.output.delivery}"
+                    }
+                }
+            ]
+        }
+    }
+}

@@ -1,7 +1,7 @@
 """What a workspace needs to run its newsletter through Buttondown — declared for the core to offer.
 
 Applying (from the integration's card) creates only what is missing: the incoming webhook Buttondown
-posts subscriber events to, four workflows, and the signup form's settings (the signup type becomes a
+posts subscriber events to, five workflows, and the signup form's settings (the signup type becomes a
 signup form, internal to Marvin's Audience). Webhooks and workflows arrive switched off; turning them on
 after a review is the deliberate last step — and each can stay off on its own.
 
@@ -25,6 +25,11 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   Publishing a `newsletter-issue` entry → `create_issue_email` (draft by default; see the connection's
   Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
   `buttondown_email_id`, so a republish never makes a second email.
+  When the connection's Issue delivery is **send**, that call is a hand-off (0.9): Marvin keeps it under Settings › Automation ›
+  Results as In flight, with the email's id. Buttondown posts `email.sent` when it has finished sending, and
+  `buttondown-email-sent` settles the result as Succeeded (`resolve_email_id` first turns the webhook's id into the API's, as
+  `lookup_subscriber` does for a subscriber). A draft, and a connection with Issue delivery off, are not hand-offs and record
+  nothing. Buttondown has no event for a send that fails, so one that never completes shows as No reply.
 
 Apply can't set the match field (the hook below covers `destination` and `kind` only, not the one-entry-per-person
 setting), so it is a suggestion: the signup-type parameter's help and the signup workflow say so. Without it every
@@ -260,6 +265,41 @@ ISSUE_ON_PUBLISH = ContentBlueprint(
 )
 
 
+EMAIL_SENT = ContentBlueprint(
+    kind="workflow",
+    slug="buttondown-email-sent",
+    name="Buttondown: email sent",
+    description=(
+        "When Buttondown reports that an email has been sent, mark that send Succeeded under Settings › Automation › Results — the one "
+        "Marvin recorded as In flight when it sent the issue. An email sent from Buttondown itself is listed too."
+    ),
+    required=True,
+    category=CATEGORY,
+    parameters=(INTEGRATION_PARAM,),
+    payload={
+        "definition": {
+            "trigger": {"type": "incoming_webhook", "webhook": WEBHOOK_SLUG},
+            "conditions": [
+                {"field": "event.payload.event_type", "op": "eq", "value": "email.sent"},
+                {"field": "event.payload.data.email", "op": "exists"},
+            ],
+            "actions": [
+                # The webhook carries the email's UUID; the result was recorded under the API's em_ id.
+                {
+                    "kind": "integration",
+                    "id": "email",
+                    "integration": "{{integration}}",
+                    "action": "resolve_email_id",
+                    "args": {"email": "${event.payload.data.email}"},
+                },
+                # No `integration`: Marvin reads the status through the connection that installed the buttondown webhook.
+                {"kind": "automation_result", "status": "succeeded", "remote_id": "${steps.email.output.email_id}"},
+            ],
+        }
+    },
+)
+
+
 SIGNUP_EMAIL_FIELD = {"key": "email", "label": "Email", "type": "text", "required": True}
 
 SIGNUP_FORM = ContentBlueprint(
@@ -282,4 +322,4 @@ SIGNUP_FORM = ContentBlueprint(
     },
 )
 
-CONTENT = (SIGNUP_FORM, EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH)
+CONTENT = (SIGNUP_FORM, EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, EMAIL_SENT)

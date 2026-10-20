@@ -17,12 +17,16 @@ Buttondown quirks this hides:
   stable ``code`` (see :class:`ButtondownError`), and ``error_policy`` tells Marvin what to do about each.
 - Re-subscribing an address that never confirmed (``unactivated``) is refused as "already exists" and
   sends nothing, so ``subscribe`` asks for a confirmation reminder (``POST /subscribers/{id}/send-reminder``).
+- An email has two ids too, and probably the same two: the API returns ``em_…`` (a TypeID), the ``email.sent`` webhook most likely
+  carries the underlying UUID, as ``data.subscriber`` does for a subscriber. A TypeID is its prefix plus that UUID in base32, so
+  ``resolve_email_id`` turns either into the ``em_…`` id with no call, and the hand-off ``create_issue_email`` records is settled by it.
 - Webhooks are account-wide, and several Marvin workspaces can share one Buttondown account. Each
   workspace owns only the webhook pointing at its own hook URL; ``connect_webhooks`` never touches others.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import ClassVar
@@ -33,6 +37,7 @@ from marvin_integration_sdk import (
     CredentialField,
     ErrorPolicy,
     Handle,
+    HandsOff,
     IntegrationContext,
     IntegrationError,
     IntegrationProvider,
@@ -107,9 +112,12 @@ _SUBSCRIBER_OUT = {
     "properties": {"subscriber_id": _STR, "email": _STR, "type": _STR, "already_subscribed": _BOOL},
 }
 
-# What the declared workflows react to — nothing else is worth a delivery.
-WEBHOOK_EVENTS = ("subscriber.confirmed", "subscriber.unsubscribed")
-WEBHOOK_DESCRIPTION = "Marvin: subscriber confirmations and unsubscribes"
+# What the declared workflows react to — nothing else is worth a delivery. `email.sent` (0.9) settles a send under Results.
+WEBHOOK_EVENTS = ("subscriber.confirmed", "subscriber.unsubscribed", "email.sent")
+WEBHOOK_DESCRIPTION = "Marvin: subscriber confirmations, unsubscribes and sent emails"
+# An email's API id is this prefix plus its UUID as a TypeID suffix: 26 characters of Crockford base32 (no i, l, o or u), 130 bits.
+EMAIL_ID_PREFIX = "em_"
+TYPEID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
 WEBHOOK_ENABLED = "enabled"
 # Marvin's incoming webhook URLs are https://<api>/api/hooks/<token>.
 HOOK_PATH = "/api/hooks/"
@@ -296,7 +304,8 @@ class ButtondownProvider(IntegrationProvider):
             label="Create issue email",
             description=(
                 "Turn a newsletter issue into a Buttondown email, as the connection's Issue delivery says: off (skip), draft, or send. "
-                "Once per entry: an email already created for it is returned, not duplicated."
+                "Once per entry: an email already created for it is returned, not duplicated. Only a send is a hand-off: Marvin keeps it "
+                "under Results as in flight until Buttondown says the email was sent; a draft, a skip and an off record nothing."
             ),
             input_schema={
                 "type": "object",
@@ -323,16 +332,43 @@ class ButtondownProvider(IntegrationProvider):
             },
             output_schema={
                 "type": "object",
-                "properties": {"email_id": _STR, "status": _STR, "delivery": _STR, "skipped": {"type": "boolean"}, "reason": _STR, "url": _STR},
+                "properties": {
+                    "email_id": _STR,
+                    "status": _STR,
+                    "delivery": _STR,
+                    "skipped": _BOOL,
+                    "sent": {"type": "boolean", "description": "True only when this call created the email and asked Buttondown to send it."},
+                    "reason": _STR,
+                    "url": _STR,
+                },
             },
+            error_policy=NO_REVIEW_POLICY,
+            # `email.sent` (the buttondown-email-sent workflow) settles it by the email id. A draft is not a hand-off.
+            hands_off=HandsOff(remote_id="email_id", remote_url="url", record_if="sent"),
+        ),
+        ProviderAction(
+            key="resolve_email_id",
+            label="Resolve email id",
+            description=(
+                "Turn the email id a webhook carries (a UUID) into the id the API returns (em_…), so a sent email can be matched to the one "
+                "Marvin created. An id that is already em_… is returned as it is. Makes no call to Buttondown."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"email": {"type": "string", "description": "A webhook's data.email, or an em_ id."}},
+                "required": ["email"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object", "properties": {"email_id": _STR}},
+            cost_hint="free",
             error_policy=NO_REVIEW_POLICY,
         ),
         ProviderAction(
             key="connect_webhooks",
             label="Connect Buttondown webhooks",
             description=(
-                "Create (or update) the one Buttondown webhook that posts this workspace's subscriber confirmations and unsubscribes "
-                "to Marvin, signed with the given key. Webhooks pointing anywhere else are left alone; optionally deletes the webhook "
+                "Create (or update) the one Buttondown webhook that posts this workspace's subscriber confirmations and unsubscribes, "
+                "and the emails Buttondown has finished sending, to Marvin, signed with the given key. Webhooks pointing anywhere else are left alone; optionally deletes the webhook "
                 "for an old Marvin hook URL you are retiring."
             ),
             input_schema={
@@ -432,6 +468,7 @@ class ButtondownProvider(IntegrationProvider):
             "subscribe": self._subscribe,
             "lookup_subscriber": self._lookup_subscriber,
             "create_issue_email": self._create_issue_email,
+            "resolve_email_id": self._resolve_email_id,
             "connect_webhooks": self._connect_webhooks,
         }.get(key)
         if handler is None:
@@ -545,7 +582,15 @@ class ButtondownProvider(IntegrationProvider):
         delivery = self._delivery(ctx)
         email_id, entry_id = _text(args.get("email_id")), _text(args.get("entry_id"))
         if delivery == DELIVERY_OFF:
-            return {"email_id": email_id, "status": "", "delivery": delivery, "skipped": True, "reason": "Issue delivery is off.", "url": ""}
+            return {
+                "email_id": email_id,
+                "status": "",
+                "delivery": delivery,
+                "skipped": True,
+                "sent": False,
+                "reason": "Issue delivery is off.",
+                "url": "",
+            }
 
         existing = self._existing_email(ctx, email_id, entry_id)
         if existing:
@@ -554,6 +599,7 @@ class ButtondownProvider(IntegrationProvider):
                 "status": existing.get("status") or "",
                 "delivery": delivery,
                 "skipped": True,
+                "sent": False,  # this call sent nothing, whatever became of the email it found
                 "reason": "This issue already has a Buttondown email.",
                 "url": existing.get("absolute_url") or "",
             }
@@ -595,9 +641,25 @@ class ButtondownProvider(IntegrationProvider):
             "status": created.get("status") or payload["status"],
             "delivery": delivery,
             "skipped": False,
+            "sent": delivery == DELIVERY_SEND,  # a draft waits in Buttondown for a person: not handed off
             "reason": "",
             "url": created.get("absolute_url") or "",
         }
+
+    @staticmethod
+    def _email_typeid(value: str) -> str:
+        """An email's ``em_…`` TypeID for its UUID; anything that isn't a UUID (an ``em_`` id already) comes back as it is."""
+        try:
+            number = uuid.UUID(value).int
+        except ValueError:
+            return value
+        return EMAIL_ID_PREFIX + "".join(TYPEID_ALPHABET[(number >> shift) & 31] for shift in range(125, -1, -5))
+
+    def _resolve_email_id(self, args: dict, ctx: IntegrationContext) -> dict:
+        value = _text(args.get("email"))
+        if not value:
+            raise ValueError("resolve_email_id needs an email id (the webhook's data.email) or an em_ id.")
+        return {"email_id": self._email_typeid(value)}
 
     # ---- webhooks ---------------------------------------------------------------------------
 

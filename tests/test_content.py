@@ -9,6 +9,7 @@ from marvin_integration_buttondown import ButtondownProvider
 from marvin_integration_buttondown.content import (
     CONFIRMED,
     CONTENT,
+    EMAIL_SENT,
     EVENTS_WEBHOOK,
     ISSUE_ON_PUBLISH,
     SIGNUP_EMAIL_FIELD,
@@ -48,6 +49,7 @@ def test_declares_the_signup_form_the_webhook_and_the_workflows_and_no_collectio
         ("workflow", "buttondown-subscriber-confirmed"),
         ("workflow", "buttondown-subscriber-unsubscribed"),
         ("workflow", "buttondown-issue-on-publish"),
+        ("workflow", "buttondown-email-sent"),
     ]
     assert ButtondownProvider.content == CONTENT
     # Audience › Subscribers in Marvin replaces the two smart collections 0.3-0.7 shipped.
@@ -265,11 +267,77 @@ def test_the_signup_type_is_told_to_match_readers_by_the_subscribed_email_field(
     assert all(p is SIGNUP_TYPE_PARAM for b in CONTENT for p in b.parameters if p["key"] == "signup_type")
 
 
-def test_version_is_0_8_0_everywhere():
+def test_version_is_0_9_0_everywhere():
     import tomllib
     from pathlib import Path
 
     import marvin_integration_buttondown
 
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.8.0"
+    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.9.0"
+
+
+# --- the email-sent workflow, and the hard rule about the issue workflow --------------------------------------------
+
+
+def test_the_email_sent_workflow_settles_the_result_when_buttondown_posts_email_sent():
+    d = _definition(EMAIL_SENT)
+
+    assert d["trigger"] == {"type": "incoming_webhook", "webhook": "buttondown"}
+    assert d["conditions"] == [
+        {"field": "event.payload.event_type", "op": "eq", "value": "email.sent"},
+        {"field": "event.payload.data.email", "op": "exists"},
+    ]
+    lookup, settle = d["actions"]
+    assert (lookup["kind"], lookup["action"], lookup["id"]) == ("integration", "resolve_email_id", "email")
+    assert lookup["args"] == {"email": "${event.payload.data.email}"}
+    assert settle == {"kind": "automation_result", "status": "succeeded", "remote_id": "${steps.email.output.email_id}"}
+
+
+def test_the_email_sent_workflow_names_no_connection_on_its_result_step_because_the_webhook_says_whose_it_is():
+    settle = _steps(EMAIL_SENT)[-1]
+
+    assert settle["kind"] == "automation_result" and "integration" not in settle
+
+
+def test_the_email_sent_workflow_only_asks_which_connection_for_the_id_lookup():
+    assert [p["key"] for p in EMAIL_SENT.parameters] == ["integration"]
+    assert _steps(EMAIL_SENT)[0]["integration"] == "{{integration}}"
+    assert EMAIL_SENT.required is True and EMAIL_SENT.kind == "workflow" and EMAIL_SENT.slug == "buttondown-email-sent"
+
+
+def test_the_event_the_email_sent_workflow_reacts_to_is_one_the_connect_action_subscribes_to():
+    (condition, _) = _definition(EMAIL_SENT)["conditions"]
+
+    assert condition["value"] in WEBHOOK_EVENTS
+
+
+def test_the_email_sent_workflow_reads_only_actions_the_provider_has():
+    assert {a["action"] for a in _steps(EMAIL_SENT) if a["kind"] == "integration"} <= ACTION_KEYS
+
+
+def test_the_issue_on_publish_workflow_is_exactly_what_version_0_8_0_shipped_because_a_workspace_customised_its_copy():
+    """HARD RULE. A live workspace edited this workflow (to send Bench Notes). Marvin offers an Update whenever a blueprint's
+    definition differs from the applied one, and Update overwrites the edit. So its definition (and everything else Marvin
+    compares) must stay byte-for-byte what 0.8.0 declared: the snapshot is the 0.8.0 blueprint, read from git at aef2cb1."""
+    import dataclasses
+    import json
+    from pathlib import Path
+
+    shipped = json.loads((Path(__file__).parent / "fixtures" / "issue_on_publish_v0_8_0.json").read_text())
+
+    now = json.loads(json.dumps(dataclasses.asdict(ISSUE_ON_PUBLISH)))  # tuples as the JSON snapshot has them: lists
+    for key, value in shipped.items():
+        assert now[key] == value, f"buttondown-issue-on-publish changed its {key}: that would offer an Update that wipes a customised copy"
+    assert shipped["payload"]["definition"] == _definition(ISSUE_ON_PUBLISH)
+    assert [a["action"] for a in _steps(ISSUE_ON_PUBLISH) if a["kind"] == "integration"] == ["create_issue_email"]
+
+
+def test_the_workflows_are_the_ones_that_shipped_before_plus_the_email_sent_workflow():
+    assert [b.slug for b in CONTENT if b.kind == "workflow"] == [
+        "buttondown-subscribe-on-signup",
+        "buttondown-subscriber-confirmed",
+        "buttondown-subscriber-unsubscribed",
+        "buttondown-issue-on-publish",
+        "buttondown-email-sent",
+    ]

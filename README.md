@@ -6,7 +6,9 @@ Buttondown integration for [Marvin](https://github.com/InnerOpen/marvin): run a 
 A signup on your site becomes a Buttondown subscriber. When the reader confirms, their signup entry is
 published; when they unsubscribe, it's archived (inbox = pending, published = confirmed, archived =
 unsubscribed). A signup Buttondown refuses goes to **Needs review** with the reason, so it never waits in
-the inbox looking like a pending one. Publishing a newsletter issue creates its Buttondown email, as a
+the inbox looking like a pending one. Signups are internal to Marvin: they stay out of your content and are
+read under **Audience › Subscribers** (counts per status, search, a detail with the status history), which
+replaces the two smart collections earlier versions offered. Publishing a newsletter issue creates its Buttondown email, as a
 **draft** by default, so you review and send it in Buttondown. You can also have it sent straight away,
 or turn this off.
 
@@ -67,23 +69,22 @@ Some actions override the provider policy, because sending their entry to review
 ## What a workspace gets — declared, applied from the integration's card
 
 Nothing is created on install. **Apply** creates only what is missing. The webhook and workflows arrive
-switched off, and each can stay off on its own. The two collections are optional.
+switched off, and each can stay off on its own.
 
 | Kind | Slug | What it does |
 |---|---|---|
+| entry fields | `buttondown-signup-form` | **Signup form.** Makes the signup type a signup form: `submission.kind: signup` (its entries are newsletter signups, listed under Audience › Subscribers, not as messages) and `submission.destination: audience` (internal: out of All entries, the status lists, search and the AI index; the entry type editor's *Show in content lists* is off). Adds the `email` field the signup workflow reads, if the type lacks it. Only settings the type doesn't already store are set: a `kind` or `destination` you chose stays. Needs a Marvin with Subscribers (see [Marvin versions](#known-limits)); on an older one the settings block is ignored and you set the type's **Signup** setting by hand. |
 | incoming webhook | `buttondown` | Where Buttondown posts subscriber events (scheme `buttondown`, secret `BUTTONDOWN_SIGNING_KEY`). |
 | workflow | `buttondown-subscribe-on-signup` | `form_submission_received` for the signup type, not flagged, and not a repeat from a reader already confirmed (`event.previous_status` ≠ `published`, see [One entry per reader](#one-entry-per-reader)) → `subscribe` (tag `website`, visitor IP) → `set_metadata buttondown_subscriber_id`. **If it fails**, the error policy above applies: a refusal goes straight to **Needs review** with the reason; an outage or rate limit is retried first. |
 | workflow | `buttondown-subscriber-confirmed` | `subscriber.confirmed` → `lookup_subscriber` → the signup entry whose `metadata.buttondown_subscriber_id` matches → **publish**. No matching entry → the step is skipped (`if_none: skip`) and the run stays green. |
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. |
-| collection *(suggestion)* | `confirmed-subscribers` | **Confirmed subscribers.** Smart, private: signup-type entries that are `published`. Rules: `{"entry_types": ["<signup_type>"], "statuses": ["published"], "match": "all"}`. |
-| collection *(suggestion)* | `unsubscribed` | **Unsubscribed.** Smart, private: signup-type entries that are `archived`. Rules: `{"entry_types": ["<signup_type>"], "statuses": ["archived"], "match": "all"}`. |
 
-The collections need no workflow. The confirm and unsubscribe workflows already set the signup's status,
-and a smart collection's membership follows the status, so a reader moves from one to the other on their
-own. Both are private (**Visible to sites** off), so a confirm or unsubscribe never rebuilds a site and
-the publishing API never lists your readers. Applying a collection fills it straight away from the
-signups you already have.
+## Subscribers replaces the collections
+
+Versions 0.3 to 0.7 offered two private smart collections, **Confirmed subscribers** and **Unsubscribed**. A signup's status already says where it stands (published = confirmed, archived = unsubscribed), and Marvin's **Audience › Subscribers** now shows every signup with its status (**Pending**, **Confirmed**, **Unsubscribed**, **Needs a look**), counts at the top, search, filters by form, status and date, and a detail for each. The collections are no longer shipped, and Marvin's own upgrade removes the ones this integration made (only those still exactly as it created them: a collection you renamed, made public or changed is left alone).
+
+What Subscribers does and doesn't do: it lists and opens signups, and can move one to the Trash. It never subscribes or unsubscribes anyone: that stays here (the subscribe workflow, the confirm and unsubscribe webhook workflows). When this integration is connected the page says so; without a mailing-list integration it still lists signups, with a hint to connect one.
 
 Parameters, asked when you apply:
 
@@ -94,9 +95,7 @@ Parameters, asked when you apply:
 ## Setting it up
 
 1. Store the API key as a workspace secret. Connect the integration with `{{BUTTONDOWN_API_KEY}}` and pick the **Issue delivery**. Set a **Site URL** only if the workspace has no Canonical URL.
-2. **Apply** the content. Skip the two collections if you don't want them. If the workspace already has a
-   collection called `confirmed-subscribers` or `unsubscribed`, Apply leaves it alone; see
-   [Upgrading from 0.2](#upgrading-from-02-collection-workflows--smart-collections).
+2. **Apply** the content. This makes the signup type a signup form, so it appears under **Audience › Subscribers**.
 3. Open the `buttondown` incoming webhook (Automation → Incoming webhooks). Click **Mint token** and copy the URL. Under **Signing**, click **Change**, keep the secret `BUTTONDOWN_SIGNING_KEY` and click **Generate key**. You can skip this if the workspace already has that secret. You don't paste the key anywhere: the next step hands it to Buttondown.
 4. On the integration's card, run **Connect Buttondown webhooks** with:
    - **webhook_url**: the URL from step 3
@@ -111,7 +110,7 @@ Repeat steps 3–7 in **every workspace that shares the Buttondown account**.
 
 ### One entry per reader
 
-Marvin can keep one entry per person for a submittable type: its match field (`capabilities.submission.matchField`, **Same person = same …** in the editor). Set it to `email` on the signup type and a repeat signup updates the reader's entry instead of adding a second one. Apply can't set it for you (a blueprint can add fields to an entry type, not change its submission settings), so it's step 7 above. Or set it through the API: `PATCH` the entry type with `capabilitiesJson.submission.matchField: "email"`, keeping its other capabilities.
+Marvin can keep one entry per person for a submittable type: its match field (`capabilities.submission.matchField`, **Same person = same …** in the editor). Set it to `email` on the signup type and a repeat signup updates the reader's entry instead of adding a second one. Apply can't set it for you (a blueprint may set a form's `destination` and `kind`, nothing else), so it's step 7 above. Or set it through the API: `PATCH` the entry type with `capabilitiesJson.submission.matchField: "email"`, keeping its other capabilities.
 
 With it set, the signup workflow (0.6.0+) handles a repeat by what the reader's entry was before:
 
@@ -132,35 +131,13 @@ Each workspace then receives every confirm and unsubscribe on the account, inclu
 
 If a hook token is rotated, run **Connect Buttondown webhooks** again with the new URL and the old one as `remove_legacy_url`.
 
-## Upgrading from 0.2: collection workflows → smart collections
+## Upgrading to 0.8: Subscribers replaces the collections
 
-0.2 offered two optional workflows, `buttondown-confirmed-to-collection` and
-`buttondown-unsubscribed-from-collection`, that added a signup to a collection on confirm and removed it
-on unsubscribe. 0.3 drops them for the two smart collections above. The integration's card no longer
-lists the old workflows, but a workspace that applied them keeps them (and they keep running if they
-are on) until you delete them.
-
-Apply never overwrites, and a collection can't be updated from its blueprint (only workflows can). So
-in a workspace that already has a collection with either slug, the card shows it as already applied,
-and applying reports `a collection with slug '…' already exists — left as it is`. Nothing is
-converted. Switch it by hand:
-
-1. Automation → Workflows: delete `buttondown-confirmed-to-collection` and
-   `buttondown-unsubscribed-from-collection` (or whatever you called the hand-built ones).
-2. Collections → `confirmed-subscribers` → **Edit**:
-   - tick **Smart Collection**, keep **Collect: Entries**
-   - on the **Builder** tab, pick your signup entry type (e.g. `newsletter`) and the status
-     **published**, matching **all**. Or paste on the **JSON** tab:
-     `{"entry_types": ["newsletter"], "statuses": ["published"], "match": "all"}`. The builder leaves
-     out `"match": "all"` because it's the default; the rules are the same.
-   - untick **Visible to sites**
-   - save. Membership is recomputed from the rules on save. Anything added by hand that doesn't match
-     is dropped, and every published signup is added.
-3. Do the same for `unsubscribed` with the status **archived**:
-   `{"entry_types": ["newsletter"], "statuses": ["archived"], "match": "all"}`.
-
-Or delete the old collections and **Apply** the two from the card instead, if nothing else uses them.
-A workspace without either collection just applies them.
+- **Core does the clean-up.** On a Marvin with Subscribers, its upgrade removes this integration's `confirmed-subscribers` and `unsubscribed` collections where they are still exactly what 0.3–0.7 created (smart, private, one signup type, one status), and marks the signup type a signup form (`submission.kind: signup`) when it can tell which type Buttondown was applied with. Nothing else is touched; no entry changes.
+- **Hand-made or changed collections stay.** A collection with one of those slugs that you edited, or built yourself (including one converted from 0.2's collection workflows), is yours: delete it from Collections if you no longer want it.
+- **A workspace the upgrade couldn't mark** (the subscribe workflow was deleted, or the signup type has another name and no workflow names it): apply `buttondown-signup-form` from the card, or open the signup entry type and set **Signup** under Submission settings. One click either way.
+- **0.2's `buttondown-confirmed-to-collection` / `buttondown-unsubscribed-from-collection` workflows** were dropped in 0.3 and still run in a workspace that applied them, if they are on. Delete them (Automation › Workflows); Subscribers makes them unnecessary.
+- **On an older Marvin** (without Subscribers) nothing breaks: the signup form blueprint still applies (it only adds `email` if missing, its settings block is ignored), the collections are no longer offered, and the ones already there keep working. Set the **Signup** setting by hand when you upgrade Marvin, or apply the blueprint then.
 
 ## Known limits
 
@@ -168,18 +145,18 @@ A workspace without either collection just applies them.
 - **A refused signup goes to Needs review; a refusal is never retried.** When Buttondown refuses an address, the signup workflow's run fails (it shows under **Runs**) and the error policy moves the entry to **Needs review** with the reason, which the Review Queue's card shows. Look at the entry: a firewall refusal (`blocked` / `spammy`) is usually spam you can archive; a real reader can be added by hand in Buttondown. Only an outage, a rate limit or a rejected key is retried (see the table above); an `unknown` failure goes to review straight away.
 - **Returning readers are manual for now.** An address that unsubscribed before can't rejoin from a signup: Buttondown answers `subscriber_suppressed`, the run fails and the entry goes to Needs review with code `suppressed`. To let them back in, re-add or re-confirm them in Buttondown (Subscribers → the address → change its type, or send a new confirmation). Their next `subscriber.confirmed` then publishes the entry as usual. With [one entry per reader](#one-entry-per-reader) the rejoin attempt reopens their archived entry instead of adding a new one, so it's that entry that goes to Needs review.
 - Updating a Buttondown webhook in place needs a Marvin whose integration HTTP helper has PATCH. On an older Marvin, `connect_webhooks` replaces the webhook instead: it creates the new one, then deletes the old one (`result: replaced`). The outcome is the same, but the webhook gets a new id.
-- Marvin versions: `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox. One entry per reader needs a Marvin with the submission match field; on an older one every signup is its own entry and the `previous_status` condition always passes.
+- Marvin versions: the signup form settings and Audience › Subscribers need the Marvin release after 1.1.0-rc.14 (a blueprint's `submission` block is ignored before that). `${site.url}` needs 1.0.0-rc.177+. `${entry.url}` and the entry step's `if_none: skip` need the release after it. On an older Marvin they are ignored: no canonical URL is sent (set the connection's Site URL for links), and a reader with no signup entry fails the step. The error policy needs a Marvin that reads SDK 0.5 error policies; an older Marvin ignores it, so a failed signup just fails its run and the entry stays in the inbox. One entry per reader needs a Marvin with the submission match field; on an older one every signup is its own entry and the `previous_status` condition always passes.
 - **Upgrading to 0.6.0:** the signup workflow gained the `previous_status` condition. The card marks an applied copy with **↑**; click **Update** to pick it up (whether it's switched on is kept), then do step 7.
 - **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
-## What it teaches Marvin (0.7.0, SDK 0.9.0)
+## What it teaches Marvin (0.8.0, SDK 0.9.0)
 
 - **A guide** (`src/marvin_integration_buttondown/guide.md`): connecting it, what each action takes and returns, how
   Issue delivery (draft or send) fits a workflow, what it can't do, and what each error code means. Marvin's agents
   read it when building workflows where Buttondown is connected, and Marvin's manual search finds it.
 - **A recipe** in the Workflow Library, *Subscribe form submitters who opt in*: when a form other than the newsletter
   signup (a contact or event form) is submitted with its opt-in checkbox ticked, the sender is subscribed through
-  `subscribe`. Shown as "From the Buttondown plugin 0.7.0", offered once Buttondown is connected. Marvin's own
+  `subscribe`. Shown as "From the Buttondown plugin 0.8.0", offered once Buttondown is connected. Marvin's own
   *Newsletter delivery* recipe already covers the issue side, so it isn't repeated here. Confirmations and
   unsubscribes only update signup-type entries, so a reader subscribed this way isn't tracked back on the form entry.
 

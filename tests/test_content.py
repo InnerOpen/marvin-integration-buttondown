@@ -1,4 +1,4 @@
-"""Declared content: the webhook, workflows and collections a workspace applies from the integration's card."""
+"""Declared content: the signup form settings, the webhook and the workflows a workspace applies from the integration's card."""
 
 import re
 
@@ -8,15 +8,15 @@ from marvin_integration_sdk import Handle, resolve_policy
 from marvin_integration_buttondown import ButtondownProvider
 from marvin_integration_buttondown.content import (
     CONFIRMED,
-    CONFIRMED_SUBSCRIBERS,
     CONTENT,
     EVENTS_WEBHOOK,
     ISSUE_ON_PUBLISH,
+    SIGNUP_EMAIL_FIELD,
+    SIGNUP_FORM,
     SIGNUP_MATCH_FIELD,
     SIGNUP_TYPE_PARAM,
     SUBSCRIBE_ON_SIGNUP,
     UNSUBSCRIBED,
-    UNSUBSCRIBED_READERS,
 )
 from marvin_integration_buttondown.provider import (
     CODE_AUTH,
@@ -40,28 +40,56 @@ def _steps(blueprint):
     return _definition(blueprint)["actions"]
 
 
-def test_declares_the_webhook_workflows_and_collections():
+def test_declares_the_signup_form_the_webhook_and_the_workflows_and_no_collections():
     assert [(b.kind, b.slug) for b in CONTENT] == [
+        ("entry_fields", "buttondown-signup-form"),
         ("incoming_webhook", "buttondown"),
         ("workflow", "buttondown-subscribe-on-signup"),
         ("workflow", "buttondown-subscriber-confirmed"),
         ("workflow", "buttondown-subscriber-unsubscribed"),
         ("workflow", "buttondown-issue-on-publish"),
-        ("collection", "confirmed-subscribers"),
-        ("collection", "unsubscribed"),
     ]
     assert ButtondownProvider.content == CONTENT
+    # Audience › Subscribers in Marvin replaces the two smart collections 0.3-0.7 shipped.
+    assert not [b for b in CONTENT if b.kind == "collection"]
+    assert not {"confirmed-subscribers", "unsubscribed"} & {b.slug for b in CONTENT}
 
 
-def test_the_collections_are_suggestions_and_the_loop_is_required():
-    assert [b.slug for b in CONTENT if not b.required] == [CONFIRMED_SUBSCRIBERS.slug, UNSUBSCRIBED_READERS.slug]
+def test_everything_is_required_the_loop_and_the_signup_form_alike():
+    assert [b.slug for b in CONTENT if not b.required] == []
 
 
 def test_no_workflow_maintains_a_collection():
-    # Membership follows the signup's status through smart rules, so no step adds or removes it by hand.
+    # A signup's status already says where it stands (Audience › Subscribers reads it), so no step adds or removes membership.
     ops = {step.get("op") for b in WORKFLOWS for step in _steps(b) + _definition(b).get("on_failure", [])}
     assert not ops & COLLECTION_OPS
     assert "collection" not in {p["key"] for b in CONTENT for p in b.parameters}
+
+
+# --- the signup form: a hook core applies, ignored by an older core ---------------------------------------
+
+
+def test_the_signup_form_blueprint_sets_the_kind_and_destination_of_the_signup_type():
+    payload = SIGNUP_FORM.payload
+    assert payload["entry_type"] == "{{signup_type}}"
+    # Exactly the two settings the core hook accepts (services/blueprints/apply.py), as Subscribers and "internal" need them.
+    assert payload["submission"] == {"kind": "signup", "destination": "audience"}
+    assert [p["key"] for p in SIGNUP_FORM.parameters] == ["signup_type"] and SIGNUP_FORM.parameters[0] is SIGNUP_TYPE_PARAM
+
+
+def test_an_older_core_still_accepts_it_and_ignores_the_submission_block():
+    # Before the hook, an entry_fields blueprint was valid only with a non-empty `fields` list and carried nothing else it read.
+    # Declaring the email field the signup workflow reads keeps it valid (and useful) there; its `submission` block is not looked at.
+    fields = SIGNUP_FORM.payload["fields"]
+    assert fields == [SIGNUP_EMAIL_FIELD] and fields
+    assert set(SIGNUP_FORM.payload) == {"entry_type", "fields", "submission"}
+    assert SIGNUP_EMAIL_FIELD["key"] == SIGNUP_MATCH_FIELD == "email"
+    (subscribe,) = _integration_steps(SUBSCRIBE_ON_SIGNUP)
+    assert subscribe["args"]["email"] == "${event.submission_data.email}"  # the field the signup reads
+
+
+def test_the_signup_form_description_says_what_it_does_and_that_choices_are_kept():
+    assert "Audience › Subscribers" in SIGNUP_FORM.description and "already chose are kept" in SIGNUP_FORM.description
 
 
 def test_the_webhook_requires_the_buttondown_signature():
@@ -123,55 +151,15 @@ def test_confirmed_publishes_and_unsubscribed_archives_the_signup_entry():
     assert _subscriber_event_shape(UNSUBSCRIBED, "subscriber.unsubscribed")["op"] == "archive"
 
 
-# --- smart collections: membership follows the signup's status ---------------------------------------
+# --- placeholders -----------------------------------------------------------------------------------------
 
 _PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
-
-
-def _substitute(value, params):
-    """Marvin's blueprint `{{key}}` substitution: a lone placeholder becomes the value itself."""
-    if isinstance(value, str):
-        whole = _PLACEHOLDER.fullmatch(value.strip())
-        if whole and whole.group(1) in params:
-            return params[whole.group(1)]
-        return _PLACEHOLDER.sub(lambda m: str(params.get(m.group(1), m.group(0))), value)
-    if isinstance(value, list):
-        return [_substitute(v, params) for v in value]
-    if isinstance(value, dict):
-        return {k: _substitute(v, params) for k, v in value.items()}
-    return value
 
 
 def test_every_placeholder_is_a_declared_parameter():
     for blueprint in CONTENT:
         used = set(_PLACEHOLDER.findall(repr((blueprint.slug, blueprint.name, blueprint.payload))))
         assert used <= {p["key"] for p in blueprint.parameters}, blueprint.slug
-
-
-@pytest.mark.parametrize(
-    "blueprint,slug,status",
-    [(CONFIRMED_SUBSCRIBERS, "confirmed-subscribers", "published"), (UNSUBSCRIBED_READERS, "unsubscribed", "archived")],
-)
-def test_collection_is_a_private_smart_collection_of_signups_in_one_status(blueprint, slug, status):
-    assert (blueprint.kind, blueprint.slug) == ("collection", slug)
-    assert [p["key"] for p in blueprint.parameters] == ["signup_type"]
-    payload = blueprint.payload
-    # Private: confirms and unsubscribes never rebuild a site, and the publishing API never lists readers.
-    assert (payload["is_smart"], payload["is_public"]) == (True, False)
-    assert payload["smart_rules"] == {"entry_types": ["{{signup_type}}"], "statuses": [status], "match": "all"}
-
-
-def test_signup_type_resolves_inside_the_smart_rules():
-    for blueprint, status in ((CONFIRMED_SUBSCRIBERS, "published"), (UNSUBSCRIBED_READERS, "archived")):
-        rules = _substitute(blueprint.payload, {"signup_type": "mailing-list"})["smart_rules"]
-        assert rules == {"entry_types": ["mailing-list"], "statuses": [status], "match": "all"}
-
-
-def test_the_collections_split_signups_by_the_statuses_the_workflows_set():
-    # Confirmed publishes and unsubscribed archives; the collections must read exactly those statuses.
-    status_after = {"publish": "published", "archive": "archived"}
-    assert CONFIRMED_SUBSCRIBERS.payload["smart_rules"]["statuses"] == [status_after[_steps(CONFIRMED)[-1]["op"]]]
-    assert UNSUBSCRIBED_READERS.payload["smart_rules"]["statuses"] == [status_after[_steps(UNSUBSCRIBED)[-1]["op"]]]
 
 
 def test_issue_workflow_creates_the_email_once_and_records_its_id():
@@ -277,11 +265,11 @@ def test_the_signup_type_is_told_to_match_readers_by_the_subscribed_email_field(
     assert all(p is SIGNUP_TYPE_PARAM for b in CONTENT for p in b.parameters if p["key"] == "signup_type")
 
 
-def test_version_is_0_7_0_everywhere():
+def test_version_is_0_8_0_everywhere():
     import tomllib
     from pathlib import Path
 
     import marvin_integration_buttondown
 
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.7.0"
+    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.8.0"

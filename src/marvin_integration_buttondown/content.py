@@ -1,9 +1,9 @@
 """What a workspace needs to run its newsletter through Buttondown — declared for the core to offer.
 
 Applying (from the integration's card) creates only what is missing: the incoming webhook Buttondown
-posts subscriber events to, four workflows, and two optional private smart collections (confirmed
-and unsubscribed readers). Webhooks and workflows arrive switched off; turning them on after a
-review is the deliberate last step — and each can stay off on its own.
+posts subscriber events to, four workflows, and the signup form's settings (the signup type becomes a
+signup form, internal to Marvin's Audience). Webhooks and workflows arrive switched off; turning them on
+after a review is the deliberate last step — and each can stay off on its own.
 
 The loop (Marvin is the list of record; a signup entry's status mirrors Buttondown):
   a site signup (a `newsletter` form submission, not flagged as spam) → `subscribe` → the subscriber's
@@ -18,7 +18,7 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   list. A repeat that reopened an unsubscribed (archived) entry, or one still pending, subscribes again;
   Buttondown answers that idempotently.
   A signup Buttondown refuses (spam firewall, an earlier unsubscribe) or that fails otherwise goes to
-  Needs review instead of waiting in the inbox like a pending one. That is the provider's error policy
+  Needs review instead of waiting in the inbox like a pending one (Audience › Subscribers shows it as needing a look). That is the provider's error policy
   (see `ButtondownProvider.error_policy`), applied by Marvin, not workflow steps: Marvin records the
   failure on the entry as `integration_error.buttondown` and the message as its review reason, and
   retries a Buttondown outage or rate limit first.
@@ -26,20 +26,23 @@ The loop (Marvin is the list of record; a signup entry's status mirrors Buttondo
   Issue delivery; the entry's page as its canonical URL) → the email's id stored on the entry as
   `buttondown_email_id`, so a republish never makes a second email.
 
-Apply can't set the match field (a blueprint can add fields to an entry type, not change its submission
-settings), so it is a suggestion: the signup-type parameter's help and the signup workflow say so.
-Without it every signup is its own entry, as before, and the duplicate condition never matches.
+Apply can't set the match field (the hook below covers `destination` and `kind` only, not the one-entry-per-person
+setting), so it is a suggestion: the signup-type parameter's help and the signup workflow say so. Without it every
+signup is its own entry, as before, and the duplicate condition never matches.
 
 Needs Marvin rc.177+ for `${site.url}`, and the release after it for `${entry.url}` and the entry
 step's `if_none: skip` (on an older Marvin both are ignored: no canonical URL, and a reader with no
 signup entry fails the step). The error policy needs a Marvin that reads SDK 0.5 policies; an older
 one ignores it (the run fails and the entry stays in the inbox, as before).
 
-The collections need no workflow: a signup's status already says where it stands (published =
-confirmed, archived = unsubscribed), so each is a smart collection over the signup type and one
-status, and membership follows the entry. Both are private (not "Visible to sites"), so changes to
-them never rebuild a site and a site can't read the list. Apply never overwrites: a workspace that
-already has a collection with either slug keeps it as it is (switch it to Smart by hand).
+The signup form's settings (0.8): an `entry_fields` blueprint with a `submission` block, which a Marvin with Audience
+Subscribers (the release after 1.1.0-rc.14) applies to the signup type: `kind: signup` (the form's entries are newsletter signups, listed
+under Audience › Subscribers, not as messages) and `destination: audience` (internal: out of All entries, the status
+lists, search and the AI index). Only settings the type doesn't already store are set; a choice someone made stays. It also
+declares the `email` field the subscribe workflow reads, added when the type lacks it. On an older Marvin the `submission`
+block is ignored (the blueprint is still valid: it adds `email` if missing and reports the type as already set up), so set
+the type's **Signup** setting by hand in the entry type editor. That is all Subscribers needs: it replaces the two smart
+collections 0.3–0.7 offered ("Confirmed subscribers", "Unsubscribed"), which are no longer shipped.
 
 Parameters: `integration` (this integration's slug in the workspace, default `buttondown`),
 `signup_type` (the signup form's entry type, default `newsletter`) and `issue_type` (the issue
@@ -68,7 +71,8 @@ SIGNUP_TYPE_PARAM = {
     "kind": "entry_type",
     "default": "newsletter",
     "help": (
-        "The submittable type your site's signup form creates entries of. Suggested: set its Submission settings → "
+        "The submittable type your site's signup form creates entries of; Apply makes it a signup form (Audience › Subscribers). "
+        "Suggested: set its Submission settings → "
         f"Same person = same … to `{SIGNUP_MATCH_FIELD}`, so a repeat signup updates the reader's entry instead of adding a second one."
     ),
 }
@@ -256,42 +260,26 @@ ISSUE_ON_PUBLISH = ContentBlueprint(
 )
 
 
-def _signups_with_status(slug: str, name: str, description: str, status: str, icon: str) -> ContentBlueprint:
-    """A private smart collection of the signup entries in one status.
+SIGNUP_EMAIL_FIELD = {"key": "email", "label": "Email", "type": "text", "required": True}
 
-    Optional (a suggestion): the loop works without it. Private so membership changes — every
-    confirm and unsubscribe — never request a site rebuild, and the publishing API never lists readers."""
-    return ContentBlueprint(
-        kind="collection",
-        slug=slug,
-        name=name,
-        description=description,
-        category=CATEGORY,
-        parameters=(SIGNUP_TYPE_PARAM,),
-        payload={
-            "description": description,
-            "icon": icon,
-            "is_smart": True,
-            "is_public": False,
-            "smart_rules": {"entry_types": ["{{signup_type}}"], "statuses": [status], "match": "all"},
-        },
-    )
-
-
-CONFIRMED_SUBSCRIBERS = _signups_with_status(
-    "confirmed-subscribers",
-    "Confirmed subscribers",
-    "Signups confirmed in Buttondown (published). Fills itself as readers confirm; private, so sites never see it.",
-    "published",
-    "📬",
+SIGNUP_FORM = ContentBlueprint(
+    kind="entry_fields",
+    slug="buttondown-signup-form",
+    name="Buttondown: signup form",
+    description=(
+        "Makes the signup type a signup form: its entries are newsletter signups, listed under Audience › Subscribers (pending, "
+        "confirmed, unsubscribed, needing a look) and kept out of your content lists. Adds the email field the signup reads if "
+        "the type lacks it. Settings you already chose are kept."
+    ),
+    required=True,
+    category=CATEGORY,
+    parameters=(SIGNUP_TYPE_PARAM,),
+    payload={
+        "entry_type": "{{signup_type}}",
+        "fields": [SIGNUP_EMAIL_FIELD],
+        # The hook on a form's settings (core: services/blueprints/apply.py). A Marvin without it ignores this block.
+        "submission": {"kind": "signup", "destination": "audience"},
+    },
 )
 
-UNSUBSCRIBED_READERS = _signups_with_status(
-    "unsubscribed",
-    "Unsubscribed",
-    "Signups that unsubscribed in Buttondown (archived). Fills itself as readers leave; private, so sites never see it.",
-    "archived",
-    "📭",
-)
-
-CONTENT = (EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, CONFIRMED_SUBSCRIBERS, UNSUBSCRIBED_READERS)
+CONTENT = (SIGNUP_FORM, EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH)

@@ -14,8 +14,10 @@ entry, and a published newsletter issue becomes a Buttondown email (a draft to r
    - **Site URL** (optional): your public site, e.g. `https://example.com`. Relative links in an issue (`/works/x`)
      are made absolute against it so they work in the email. Blank means the workspace's Canonical URL
      (Settings -> General).
-3. Apply the integration's content from its card: the `buttondown` incoming webhook and the workflows below. They
-   arrive switched off; review them, then turn them on.
+3. Apply the integration's content from its card: the signup form settings (the signup type becomes a signup form, listed
+   under Audience -> Subscribers), the `buttondown` incoming webhook and the workflows below. The webhook and workflows
+   arrive switched off; review them, then turn them on. On a Marvin older than the one with Subscribers, the signup form
+   settings can't be applied: set the signup type's **Signup** setting in the entry type editor instead.
 4. To hear back from Buttondown: mint the `buttondown` incoming webhook's token, generate a key under Signing (stored
    as `BUTTONDOWN_SIGNING_KEY`), then run the **Connect Buttondown webhooks** action with the webhook's URL. It is safe
    to run again. Buttondown's dashboard "Test webhook" button sends unsigned, so Marvin rejects it; real events are
@@ -24,7 +26,12 @@ entry, and a published newsletter issue becomes a Buttondown email (a draft to r
 ## The loop
 
 A signup entry's status mirrors Buttondown: inbox = waiting for the reader to confirm, published = confirmed,
-archived = unsubscribed.
+archived = unsubscribed, needs review = a problem (Buttondown refused it, or the spam protection held it).
+
+Signups are internal to Marvin: the signup type is a signup form (`submission.kind: signup`, destination Audience), so its
+entries stay out of All entries, the status lists, search and the AI index, and are read under **Audience -> Subscribers**
+(counts per status, search, a detail with the history). Applying the integration's content sets this on the signup type.
+Subscribers is read-only for Buttondown's part: subscribing and unsubscribing happen here, in the workflows and webhook below.
 
 - A submission of the signup entry type (not flagged as spam) runs `subscribe`; the subscriber's id is stored on the
   entry as `buttondown_subscriber_id`.
@@ -35,7 +42,8 @@ archived = unsubscribed.
   skipped.
 - Publishing an entry of the issue type runs `create_issue_email`; the email's id is stored on the entry as
   `buttondown_email_id`.
-- Two optional private smart collections list confirmed and unsubscribed readers.
+- Nothing else is needed to list readers by status: Audience -> Subscribers does it. (Earlier versions offered two smart
+  collections, "Confirmed subscribers" and "Unsubscribed"; they are gone, and Marvin removes the ones this integration made.)
 
 ## Actions
 

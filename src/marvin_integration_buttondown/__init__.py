@@ -3,4 +3,4 @@
 from .provider import ButtondownProvider
 
 __all__ = ["ButtondownProvider"]
-__version__ = "0.7.0"
+__version__ = "0.8.0"

@@ -121,8 +121,9 @@ Parameters, asked when you apply:
 5. Switch on the `buttondown` incoming webhook and the workflows you want. A provider can't switch Marvin's webhooks on, so this one is a click.
 6. If you had an older hand-built Buttondown hook in Marvin, delete it (Automation → Incoming webhooks).
 7. Open the signup entry type (e.g. `newsletter`) and, under **Submission settings**, set **Same person = same …** to `email`. See [One entry per reader](#one-entry-per-reader).
+8. **Check Buttondown's side.** In Buttondown, open **Settings → Webhooks**: the Marvin webhook must list all three events, `subscriber.confirmed`, `subscriber.unsubscribed` and **`email.sent`**. Without `email.sent` every send stays *In flight* under Settings › Automation › Results and turns into *No reply* a day later. If one is missing, run **Connect Buttondown webhooks** again (it updates the existing webhook), or add the event by hand in Buttondown. Also check that the `buttondown-email-sent` workflow is switched on (step 5). Seen on Mash & Burn after the 0.9 upgrade: `email.sent` was missing and the workflow was off.
 
-Repeat steps 3–7 in **every workspace that shares the Buttondown account**.
+Repeat steps 3–8 in **every workspace that shares the Buttondown account**.
 
 ### One entry per reader
 

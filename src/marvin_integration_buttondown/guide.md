@@ -22,6 +22,10 @@ entry, and a published newsletter issue becomes a Buttondown email (a draft to r
    as `BUTTONDOWN_SIGNING_KEY`), then run the **Connect Buttondown webhooks** action with the webhook's URL. It is safe
    to run again. Buttondown's dashboard "Test webhook" button sends unsigned, so Marvin rejects it; real events are
    signed.
+5. Check it took: in Buttondown, **Settings → Webhooks** must list `subscriber.confirmed`, `subscriber.unsubscribed` and
+   **`email.sent`** for the Marvin webhook, and the `buttondown-email-sent` workflow must be switched on. Without both,
+   sends stay *In flight* under Settings › Automation › Results and become *No reply* after a day. Missing an event: run
+   **Connect Buttondown webhooks** again, or add it by hand in Buttondown.
 
 ## The loop
 

@@ -49,6 +49,13 @@ Subscribers is read-only for Buttondown's part: subscribing and unsubscribing ha
 - Nothing else is needed to list readers by status: Audience -> Subscribers does it. (Earlier versions offered two smart
   collections, "Confirmed subscribers" and "Unsubscribed"; they are gone, and Marvin removes the ones this integration made.)
 
+## A Playbook for issues
+
+The card's **Optional** content includes the Playbook `buttondown-newsletter-issue`: what makes a good issue (the subject,
+the preview and the body, what Buttondown renders, and that publishing sends or drafts it by the connection's Issue
+delivery). Add it, read it and publish it on the Playbooks page to have your agents follow it when they draft an issue.
+It arrives as a draft and is never published for you; an update from the integration asks first if you have changed it.
+
 ## Actions
 
 **Subscribe** (`subscribe`)

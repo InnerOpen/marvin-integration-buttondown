@@ -50,6 +50,7 @@ def test_declares_the_signup_form_the_webhook_and_the_workflows_and_no_collectio
         ("workflow", "buttondown-subscriber-unsubscribed"),
         ("workflow", "buttondown-issue-on-publish"),
         ("workflow", "buttondown-email-sent"),
+        ("playbook", "buttondown-newsletter-issue"),
     ]
     assert ButtondownProvider.content == CONTENT
     # Audience › Subscribers in Marvin replaces the two smart collections 0.3-0.7 shipped.
@@ -57,8 +58,9 @@ def test_declares_the_signup_form_the_webhook_and_the_workflows_and_no_collectio
     assert not {"confirmed-subscribers", "unsubscribed"} & {b.slug for b in CONTENT}
 
 
-def test_everything_is_required_the_loop_and_the_signup_form_alike():
-    assert [b.slug for b in CONTENT if not b.required] == []
+def test_everything_is_required_the_loop_and_the_signup_form_alike_except_the_playbook():
+    # A Playbook is a suggestion: Marvin refuses one marked required, and the integration works without it.
+    assert [b.slug for b in CONTENT if not b.required] == ["buttondown-newsletter-issue"]
 
 
 def test_no_workflow_maintains_a_collection():
@@ -267,14 +269,14 @@ def test_the_signup_type_is_told_to_match_readers_by_the_subscribed_email_field(
     assert all(p is SIGNUP_TYPE_PARAM for b in CONTENT for p in b.parameters if p["key"] == "signup_type")
 
 
-def test_version_is_0_9_0_everywhere():
+def test_version_is_0_10_0_everywhere():
     import tomllib
     from pathlib import Path
 
     import marvin_integration_buttondown
 
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.9.0"
+    assert marvin_integration_buttondown.__version__ == pyproject["project"]["version"] == "0.10.0"
 
 
 # --- the email-sent workflow, and the hard rule about the issue workflow --------------------------------------------

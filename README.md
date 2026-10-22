@@ -81,6 +81,7 @@ switched off, and each can stay off on its own.
 | workflow | `buttondown-subscriber-unsubscribed` | `subscriber.unsubscribed` → `lookup_subscriber` → that entry → **archive** (skipped quietly when there is none). |
 | workflow | `buttondown-issue-on-publish` | `entry_published` for the issue type → `create_issue_email` (title, `body`, `preview`, `${entry.url}` as canonical URL, `${site.url}`) → `set_metadata buttondown_email_id` + `buttondown_issue_delivery`. Unchanged since 0.8.0, so a workspace that edited its copy has nothing to overwrite. |
 | workflow | `buttondown-email-sent` | (0.9) `email.sent` → `resolve_email_id` → `automation_result` (Succeeded): settles the send recorded under Results. |
+| playbook | `buttondown-newsletter-issue` | (0.10, needs SDK 0.15 and a Marvin that knows Playbook blueprints) **Newsletter issue.** What makes a good issue: the subject (title), preview and Markdown body, what Buttondown renders and what it adds itself, that publishing runs `buttondown-issue-on-publish` (a draft or a send, by Issue delivery), and that an agent writes the issue itself and saves it with `create_draft` / `update_draft`, never publishing it. Files: `references/checklist.md`, `references/example-issue.md`. Arrives as a **draft Playbook** for an admin to read and publish; the folder is `src/marvin_integration_buttondown/playbooks/buttondown-newsletter-issue/`, shipped as package data. A Marvin that predates Playbook blueprints skips it and loads the rest. |
 
 ## Results (0.9)
 
@@ -166,7 +167,7 @@ If a hook token is rotated, run **Connect Buttondown webhooks** again with the n
 - **Upgrading to 0.6.0:** the signup workflow gained the `previous_status` condition. The card marks an applied copy with **↑**; click **Update** to pick it up (whether it's switched on is kept), then do step 7.
 - **Already applied the content?** Apply never overwrites, so a workspace that applied the signup workflow from 0.3.x keeps its on-failure steps (`set_metadata buttondown_subscribe_error` → `request_review`). Marvin runs a workflow's own on-failure steps instead of the provider policy, so that copy still sends refusals to review, but without the retries. The card marks it with **↑** and an **Update** button; click it to drop the on-failure steps and use the policy (whether it's switched on is kept).
 
-## What it teaches Marvin (0.8.0, SDK 0.9.0)
+## What it teaches Marvin (0.8.0, SDK 0.9.0; Playbook 0.10.0, SDK 0.15.0)
 
 - **A guide** (`src/marvin_integration_buttondown/guide.md`): connecting it, what each action takes and returns, how
   Issue delivery (draft or send) fits a workflow, what it can't do, and what each error code means. Marvin's agents
@@ -176,6 +177,9 @@ If a hook token is rotated, run **Connect Buttondown webhooks** again with the n
   `subscribe`. Shown as "From the Buttondown plugin 0.8.0", offered once Buttondown is connected. Marvin's own
   *Newsletter delivery* recipe already covers the issue side, so it isn't repeated here. Confirmations and
   unsubscribes only update signup-type entries, so a reader subscribed this way isn't tracked back on the form entry.
+
+- **A Playbook** (0.10), `buttondown-newsletter-issue`, offered on the card under Optional and added as a draft: how to write
+  an issue Buttondown can send as it is (see the content table above). Marvin's agents follow it once an admin publishes it.
 
 ## Logo
 

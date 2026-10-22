@@ -1,7 +1,7 @@
 """What Buttondown teaches Marvin (SDK 0.9.0): its guide and the opt-in recipe."""
 
 import pytest
-from marvin_integration_sdk import check_recipe, load_guide
+from marvin_integration_sdk import check_playbook, check_recipe, load_guide
 from marvin_integration_sdk.testing import IntegrationContract
 
 from marvin_integration_buttondown import ButtondownProvider
@@ -50,3 +50,39 @@ def test_the_opt_in_recipe_subscribes_the_senders_address_through_the_connection
     assert step["args"]["email"] == "${event.submission_data.{{email_field}}}"  # run-time template, filled when it runs
     assert step["args"]["ip_address"] == "${event.ip_address}"
     assert step["args"]["tags"] == ["{{tag}}"]
+
+
+# --- the Playbook (0.10.0, SDK 0.15.0) ---------------------------------------------------------------------
+
+
+def _playbook():
+    (blueprint,) = [c for c in ButtondownProvider.content if c.kind == "playbook"]
+    return blueprint
+
+
+def test_the_provider_ships_the_newsletter_issue_playbook():
+    blueprint = _playbook()
+    assert (blueprint.slug, blueprint.required) == ("buttondown-newsletter-issue", False)
+    assert sorted(blueprint.payload["files"]) == ["references/checklist.md", "references/example-issue.md"]
+    assert check_playbook(blueprint, ButtondownProvider()) == []
+
+
+def test_the_playbook_tells_the_agent_to_write_and_save_a_draft_itself():
+    body = _playbook().payload["skill_md"]
+    assert "`create_draft`" in body and "`update_draft`" in body
+    assert "`compose_entry`" in body and "`revise_entry`" in body  # named as the ones not to use
+    assert "never publish" in body.lower() or "never publishes" in body.lower() or "You never publish" in body
+
+
+def test_the_playbook_names_the_workflow_by_its_slug_and_the_workflow_exists():
+    from marvin_integration_buttondown.content import ISSUE_ON_PUBLISH
+
+    assert "buttondown-issue-on-publish" in _playbook().payload["skill_md"]
+    assert ISSUE_ON_PUBLISH.slug == "buttondown-issue-on-publish"
+
+
+def test_the_playbook_files_are_package_data():
+    from importlib import resources
+
+    root = resources.files("marvin_integration_buttondown").joinpath("playbooks", "buttondown-newsletter-issue")
+    assert root.joinpath("SKILL.md").is_file() and root.joinpath("references", "checklist.md").is_file()

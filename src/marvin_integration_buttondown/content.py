@@ -54,7 +54,7 @@ Parameters: `integration` (this integration's slug in the workspace, default `bu
 entry type, default `newsletter-issue`, whose `body` and `preview` fields make the email).
 """
 
-from marvin_integration_sdk import ContentBlueprint
+from marvin_integration_sdk import ContentBlueprint, playbook_blueprint
 
 CATEGORY = "Buttondown"
 WEBHOOK_SLUG = "buttondown"
@@ -322,4 +322,8 @@ SIGNUP_FORM = ContentBlueprint(
     },
 )
 
-CONTENT = (SIGNUP_FORM, EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, EMAIL_SENT)
+# A Playbook (0.10, SDK 0.15): what makes a good newsletter issue, as a skill folder in the package's data. A workspace adds it from the
+# card as a draft Playbook, reads it and publishes it; an older Marvin skips it and loads the rest.
+NEWSLETTER_ISSUE_PLAYBOOK = playbook_blueprint(__package__, "playbooks/buttondown-newsletter-issue")
+
+CONTENT = (SIGNUP_FORM, EVENTS_WEBHOOK, SUBSCRIBE_ON_SIGNUP, CONFIRMED, UNSUBSCRIBED, ISSUE_ON_PUBLISH, EMAIL_SENT, NEWSLETTER_ISSUE_PLAYBOOK)
